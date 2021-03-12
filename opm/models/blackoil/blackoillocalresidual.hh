@@ -149,7 +149,8 @@ public:
         ExtboModule::addStorage(storage, intQuants);
 
         // deal with polymer (if present)
-        PolymerModule::addStorage(storage, intQuants);
+        unsigned cellGlobalIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx); // note: added cell index not used atm.
+        PolymerModule::addStorage(storage, intQuants, cellGlobalIdx);
 
         // deal with energy (if present)
         EnergyModule::addStorage(storage, intQuants);

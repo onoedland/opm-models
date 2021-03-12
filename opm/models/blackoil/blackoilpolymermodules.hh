@@ -87,6 +87,7 @@ class BlackOilPolymerModule
 
     static constexpr unsigned enablePolymer = enablePolymerV;
     static constexpr bool enablePolymerMolarWeight = getPropValue<TypeTag, Properties::EnablePolymerMW>();
+    static constexpr bool enablePolymerMechanicalDegradation = getPropValue<TypeTag, Properties::EnablePolymerMechanicalDegradation>();
 
     static constexpr unsigned numEq = getPropValue<TypeTag, Properties::NumEq>();
     static constexpr unsigned numPhases = FluidSystem::numPhases;
@@ -108,6 +109,17 @@ public:
         Scalar gamma;
         Scalar kappa;
     };
+    
+    struct StashedValues {
+        Dune::FieldVector<Scalar, 6> velocity; // at faces
+        //Dune::FieldVector<Scalar, 6> distance; // cell centre --> face
+        Scalar average_cell_velocity; // m/sec (seepage velocity)
+        Scalar cell_shear_rate;
+        
+        Scalar debug_value;
+    };
+    
+    static std::map<int, StashedValues> stashedValues_;
 
 #if HAVE_ECL_INPUT
     /*!
@@ -134,9 +146,19 @@ public:
             throw std::runtime_error("Polymer molecular weight tracking is disabled at compile time, but the deck "
                                      "contains the POLYMW keyword");
         }
+        
+        if (enablePolymerMechanicalDegradation && !eclState.runspec().phases().active(Phase::POLYMW)) {
+            throw std::runtime_error("Polymer mechanical degradation model is enabled at compile time, but "
+                                     "the deck does not contain the POLYMW keyword");
+        }
 
         if (enablePolymerMolarWeight && !enablePolymer) {
             throw std::runtime_error("Polymer molecular weight tracking is enabled while polymer treatment "
+                                     "is disabled at compile time");
+        }
+        
+        if (enablePolymerMechanicalDegradation && !enablePolymer) {
+            throw std::runtime_error("Polymer mechanical degradation model is enabled while polymer treatment "
                                      "is disabled at compile time");
         }
 
@@ -190,12 +212,11 @@ public:
         const auto& plyviscTables = tableManager.getPlyviscTables();
         if (!plyviscTables.empty()) {
             // different viscosity model is used for POLYMW
-            if (enablePolymerMolarWeight) {
+            if (enablePolymerMolarWeight && !enablePolymerMechanicalDegradation) {
                 Opm::OpmLog::warning("PLYVISC should not be used in POLYMW runs, "
                                      "it will have no effect. A viscosity model based on PLYVMH is used instead.\n");
             }
             else {
-
                 assert(numPvtRegions == plyviscTables.size());
                 for (unsigned pvtRegionIdx = 0; pvtRegionIdx < numPvtRegions; ++ pvtRegionIdx) {
                     const auto& plyadsTable = plyviscTables.template getTable<Opm::PlyviscTable>(pvtRegionIdx);
@@ -205,6 +226,12 @@ public:
                     plyviscViscosityMultiplierTable_[pvtRegionIdx].setXYContainers(c, visc);
                 }
             }
+            
+            if(enablePolymerMolarWeight && enablePolymerMechanicalDegradation)
+            {
+                Opm::OpmLog::warning("Using experimental mechanical degradation model...\n");
+            }
+            
         }
         else if (!enablePolymerMolarWeight) {
             throw std::runtime_error("PLYVISC must be specified in POLYMER runs\n");
@@ -306,7 +333,7 @@ public:
             }
         }
 
-        if (enablePolymerMolarWeight) {
+        if (enablePolymerMolarWeight) { // include for both kinds of POLYMW models
             const auto& plyvmhTable = eclState.getTableManager().getPlyvmhTable();
             if (!plyvmhTable.empty()) {
                 assert(plyvmhTable.size() == numMixRegions);
@@ -318,9 +345,12 @@ public:
                 }
             }
             else {
-                throw std::runtime_error("PLYVMH keyword must be specified in POLYMW rus \n");
+                throw std::runtime_error("PLYVMH keyword must be specified in POLYMW runs \n");
             }
-
+        }
+        
+        if (enablePolymerMolarWeight){
+            
             // handling PLYMWINJ keyword
             const auto& plymwinjTables = tableManager.getPlymwinjTables();
             for (const auto& table : plymwinjTables) {
@@ -359,6 +389,12 @@ public:
                 skprpolyTables_[tableNumber] = std::move(tablefunc);
             }
         }
+        /*
+        else if(enablePolymerMolarWeight && enablePolymerMechanicalDegradation)
+        {
+            // TO DO: Read needed data from input file; need to implement new keyword(s)!
+        }
+        */
     }
 #endif
 
@@ -587,7 +623,8 @@ public:
     // must be called after water storage is computed
     template <class LhsEval>
     static void addStorage(Dune::FieldVector<LhsEval, numEq>& storage,
-                           const IntensiveQuantities& intQuants)
+                           const IntensiveQuantities& intQuants,
+                           unsigned globalCellIdx)
     {
         if (!enablePolymer)
             return;
@@ -642,6 +679,8 @@ public:
         const auto& up = elemCtx.intensiveQuantities(upIdx, timeIdx);
         const unsigned contiWaterEqIdx = Indices::conti0EqIdx + Indices::canonicalToActiveComponentIndex(FluidSystem::waterCompIdx);
 
+        unsigned globalSpaceIdxUp = elemCtx.globalSpaceIndex(upIdx, timeIdx);
+        unsigned globalSpaceIdxInt = elemCtx.globalSpaceIndex(inIdx, timeIdx);
 
         if (upIdx == inIdx) {
             flux[contiPolymerEqIdx] =
@@ -906,6 +945,7 @@ public:
     {
         return 0.25; // kg/mol
     }
+    
 
 private:
     static std::vector<Scalar> plyrockDeadPoreVolume_;
@@ -1004,6 +1044,10 @@ template <class TypeTag, bool enablePolymerV>
 std::map<int, typename BlackOilPolymerModule<TypeTag, enablePolymerV>::SkprpolyTable>
 BlackOilPolymerModule<TypeTag, enablePolymerV>::skprpolyTables_;
 
+template <class TypeTag, bool enablePolymerV>
+std::map<int, typename BlackOilPolymerModule<TypeTag, enablePolymerV>::StashedValues>
+BlackOilPolymerModule<TypeTag, enablePolymerV>::stashedValues_;
+
 /*!
  * \ingroup BlackOil
  * \class Opm::BlackOilPolymerIntensiveQuantities
@@ -1025,11 +1069,13 @@ class BlackOilPolymerIntensiveQuantities
     using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
 
     using PolymerModule = BlackOilPolymerModule<TypeTag>;
+    using StashedValues = typename PolymerModule::StashedValues;
 
     enum { numPhases = getPropValue<TypeTag, Properties::NumPhases>() };
     static constexpr int polymerConcentrationIdx = Indices::polymerConcentrationIdx;
     static constexpr int waterPhaseIdx = FluidSystem::waterPhaseIdx;
     static constexpr bool enablePolymerMolarWeight = getPropValue<TypeTag, Properties::EnablePolymerMW>();
+    static constexpr bool enablePolymerMechanicalDegradation = getPropValue<TypeTag, Properties::EnablePolymerMechanicalDegradation>();
     static constexpr int polymerMoleWeightIdx = Indices::polymerMoleWeightIdx;
 
 
@@ -1044,6 +1090,13 @@ public:
                                   unsigned dofIdx,
                                   unsigned timeIdx)
     {
+        
+        emvis_ = 17.0; // question: what is this quantity ???
+        epvis_ = 1.0;
+        ewv_pol_ = 1.0;
+        eta_rel_ = 1.0;
+        shear_rate_ = 0.0;
+        
         const auto linearizationType = elemCtx.linearizationType();
         const PrimaryVariables& priVars = elemCtx.primaryVars(dofIdx, timeIdx);
         polymerConcentration_ = priVars.makeEvaluation(polymerConcentrationIdx, timeIdx, linearizationType);
@@ -1083,6 +1136,137 @@ public:
             waterViscosityCorrection_ = muWater * ((1.0 - cbar) / viscosityWaterEffective + cbar / viscosityPolymerEffective);
             // effectiveWaterViscosity / effectivePolymerViscosity
             polymerViscosityCorrection_ =  (muWater / waterViscosityCorrection_) / viscosityPolymerEffective;
+            
+            epvis_ = viscosityPolymerEffective;
+            ewv_pol_ = viscosityWaterEffective;
+            eta_rel_ = 1.0; // not used together with eclipse model
+            
+            /*  NOTES (odn):
+            *
+            *   viscosityMixture = mu_m(C_p) (== viscosity of fully mixed polymer solution)
+            *   viscosityPolymerEffective = mu_p,eff
+            *   viscosityWaterEffective = mu_w,e (== partially mixed water viscosity)
+            *
+            *   waterViscosityCorrection_ = [(1-C_bar)/mu_w,e + C_bar/mu_p,eff]*muWater = mu_water / mu_w,eff
+            *
+            *       ---> mult. with 1/mu_water to get 1/mu_w,eff in the water flow equation
+            *            [adjust water phase mobility inside polymerPropertiesUpdate_]
+            *
+            *   polymerViscosityCorrection_ = ((muWater)*(mu_w,eff/mu_water)) / mu_p,eff = mu_w,eff / mu_p,eff
+            *
+            *       ---> First, waterVolumeFlux_, which already includes waterViscosityCorrection_ (??), 
+            *            is recovered from extQuants.volumeFlux(waterPhaseIdx).
+            *       ---> Next, the polymer flux is computed from waterVolumeFlux_ by further multiplying with 
+            *            polymerViscosityCorrection_. 
+            *            This is done for both the regular polymer component and the Mw component.
+            *       ---> Since the water flux has already been corrected by mu_water / mu_w,eff, the net effect 
+            *            is to correct by mu_water / mu_p,eff in the polymer equations.
+            */
+            
+        }
+        else if(enablePolymerMechanicalDegradation) // based on hard-coded parameters + PLYVMH (for now)
+        {
+            const auto& fs = asImp_().fluidState_;
+            
+            const Evaluation relWater = 1.0; // TO DO: Get rel.perm. of water also?
+            const Evaluation& muWater = fs.viscosity(waterPhaseIdx);
+            const Evaluation& Sw = fs.saturation(waterPhaseIdx);
+            
+            const Scalar porosity = elemCtx.problem().porosity(elemCtx, dofIdx, timeIdx);
+            const Scalar temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
+            
+            const auto& plyvmhCoefficients = PolymerModule::plyvmhCoefficients(elemCtx, dofIdx, timeIdx);
+            const Scalar k_mh = plyvmhCoefficients.k_mh;
+            const Scalar a_mh = plyvmhCoefficients.a_mh;
+            const Scalar gamma = plyvmhCoefficients.gamma;
+            const Scalar kappa = plyvmhCoefficients.kappa;
+
+            Scalar shear_rate = 0.0;
+            unsigned globalSpaceIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
+            if(!PolymerModule::stashedValues_.empty()){
+                StashedValues& stashedValues = PolymerModule::stashedValues_[globalSpaceIdx];
+                unsigned cellGlobalIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
+                shear_rate = stashedValues.cell_shear_rate;
+                
+                // TO DO: just for testing....
+                epvis_ = stashedValues.debug_value;
+                
+            }
+            
+            const bool isPolymer = (polymerConcentration_.value() > 1.0e-12) ? true : false;
+            const Scalar cPol = isPolymer ? polymerConcentration_.value() : 0.0;
+            
+            // hack: currently this must be manually updated in TWO different places..!!!
+            const bool useCarreauYasudaModel = true;
+            
+            Scalar huggins1 = 0.4;
+            Scalar huggins2 = 0.1;
+            if(useCarreauYasudaModel){
+                huggins1 = 0.01;
+                huggins2 = 0.077;
+            }
+            const Scalar pow_x = 1.0;
+            
+            const Evaluation Mw = polymerMoleWeight_ * 1000.;
+            const Evaluation intrinsicViscosity = k_mh * pow(Mw, a_mh);
+            const Evaluation x = cPol * intrinsicViscosity;
+            const Evaluation specificViscosityAtZeroShearRate = x*(1 + x*(huggins1 + huggins2*x)); // x + k1*x^2 + k2*x^3
+            
+            const Scalar lambda_a = 0.350;
+            const Scalar a_n = 0.063;
+            const Scalar b_n = 0.804;
+            
+            // Calculate Carreau-Yasuda parameters:
+            const Evaluation pow_n = 1.0 - 1.0/(1.0+pow(a_n*x, b_n));
+            
+            // note: lam1_ICS (Lohne et al. 2017) = (lam1_OPM * 1.07)*(1.0+2.5*0.0015) when using muWater=1.0 and cpol=1.5 kg/m3
+            Evaluation lambda1 = lambda_a*muWater*specificViscosityAtZeroShearRate*Mw; // unit of mu = Pa*s ??
+            if(cPol > 0.0){
+                const Scalar denominator = cPol*temperature;
+                lambda1 /= denominator;
+            }
+            
+            const Scalar gamma_hf = 20.0; // 1/sec
+            const Scalar p_alpha = 1.75;
+            
+            Evaluation shearThinningSpecificViscosity = 0.0;
+            if(useCarreauYasudaModel){
+                shearThinningSpecificViscosity = specificViscosityAtZeroShearRate*pow(1+pow(lambda1*shear_rate, pow_x), -pow_n/pow_x);
+            }
+            else{
+                // Meter's model:
+                shearThinningSpecificViscosity = specificViscosityAtZeroShearRate / (1.0 + pow(shear_rate/gamma_hf, p_alpha - 1.0));
+            }
+        
+            // Elongation & degradation parameters:
+            const Scalar critical_Deborah_number = 0.5; // el_lamf = 2.0 / N_De
+            const Scalar el_m2 = 1.5;
+            const Scalar el_x2 = 2.0;
+            
+            const Scalar gas_constant = 8.31446261815324; // J/K/mol
+            const Scalar pre_factor = 3.0/(5.0*gas_constant*critical_Deborah_number);
+            // Note (9/5-2019): pre_factor includes effect of oil being present on lambda2.
+            const Evaluation fac_k_Sw = (Sw > 0) ? (relWater / Sw) : relWater;
+            // TO DO: Add ipv and/or further Sw correction here??
+            const Evaluation volume_factor = Opm::sqrt(fac_k_Sw)* porosity / (1. - porosity);
+            // note: lam2_ICS (Lohne et al. 2017) = (lam2_OPM * 1.07)*(1.0+2.5*0.0015) when using muWater=1.0 and cpol=1.5 kg/m3
+            const Evaluation lambda2 = pre_factor*volume_factor*muWater*intrinsicViscosity*Mw/temperature;
+            const Evaluation t_exp = (el_m2 + pow_n) / el_x2;
+            const Evaluation elongationFactor = Opm::pow(1.0 + Opm::pow(lambda2 * shear_rate, el_x2), t_exp);
+            
+            // TO DO: when to select shear thickening??
+            const Evaluation specificViscosity = shearThinningSpecificViscosity; // *elongationFactor;
+            const Evaluation relativeViscosity = 1.0 + specificViscosity;
+            
+            waterViscosityCorrection_ = 1.0 / relativeViscosity;
+            polymerViscosityCorrection_ =  1.0;
+            
+            // TO DO: Not all quantities printed to summary file match their names (FOR DEBUGGING)
+            emvis_ = lambda2;
+            epvis_ = shearThinningSpecificViscosity*elongationFactor;
+            eta_rel_ = relativeViscosity;
+            shear_rate_ = shear_rate;
+            
         }
         else { // based on PLYVMH
             const auto& plyvmhCoefficients = PolymerModule::plyvmhCoefficients(elemCtx, dofIdx, timeIdx);
@@ -1095,8 +1279,14 @@ public:
             // 1000 is a emperical constant, most likely related to unit conversion
             const Evaluation intrinsicViscosity = k_mh * pow(polymerMoleWeight_ * 1000., a_mh);
             const Evaluation x = polymerConcentration_ * intrinsicViscosity;
-            waterViscosityCorrection_ = 1.0 / (1.0 + gamma * (x + kappa * x * x));
+            const Evaluation relativeViscosity = 1.0 + gamma * (x + kappa * x * x);
+            
+            //waterViscosityCorrection_ = 1.0 / (1.0 + gamma * (x + kappa * x * x));
+            waterViscosityCorrection_ = 1.0 / relativeViscosity;
             polymerViscosityCorrection_ = 1.0;
+            
+            // TO DO: Are EPVIS, EWVPOL, EMVIS relevant here??
+            eta_rel_ = relativeViscosity;
         }
 
         // adjust water mobility
@@ -1134,6 +1324,46 @@ public:
     // waterViscosity / effectiveWaterViscosity
     const Evaluation& waterViscosityCorrection() const
     { return waterViscosityCorrection_; }
+    
+    const Evaluation& polymerRelativeViscosity() const
+    { 
+    if (!enablePolymerMolarWeight)
+        throw std::logic_error("polymerRelativeViscosity() is called but polymer molecular weight is disabled");
+    
+    return eta_rel_;
+    }
+    
+    const Evaluation& epvis() const
+    { 
+    if (!enablePolymerMolarWeight)
+        throw std::logic_error("epvis() is called but polymer molecular weight is disabled");
+    
+    return epvis_; 
+    }
+    
+    const Evaluation& emvis() const
+    { 
+    if (!enablePolymerMolarWeight)
+        throw std::logic_error("emvis() is called but polymer molecular weight is disabled");
+    
+    return emvis_; 
+    }
+    
+    const Evaluation& ewvpol() const
+    { 
+    if (!enablePolymerMolarWeight)
+        throw std::logic_error("ewvpol() called but but polymer molecular weight is disabled"); 
+    
+    return ewv_pol_;
+    }
+    
+    const Evaluation& shear() const
+    { 
+    if (!enablePolymerMolarWeight)
+        throw std::logic_error("shear() called but but polymer molecular weight is disabled"); 
+    
+    return shear_rate_;
+    }
 
 
 protected:
@@ -1141,14 +1371,18 @@ protected:
     { return *static_cast<Implementation*>(this); }
 
     Evaluation polymerConcentration_;
-    // polymer molecular weight
     Evaluation polymerMoleWeight_;
     Scalar polymerDeadPoreVolume_;
     Scalar polymerRockDensity_;
     Evaluation polymerAdsorption_;
     Evaluation polymerViscosityCorrection_;
     Evaluation waterViscosityCorrection_;
-
+    
+    Evaluation eta_rel_;
+    Evaluation emvis_;
+    Evaluation epvis_;
+    Evaluation ewv_pol_;
+    Evaluation shear_rate_;
 
 };
 
@@ -1160,6 +1394,7 @@ class BlackOilPolymerIntensiveQuantities<TypeTag, false>
     using Scalar = GetPropType<TypeTag, Properties::Scalar>;
 
 public:
+
     void polymerPropertiesUpdate_(const ElementContext& elemCtx OPM_UNUSED,
                                   unsigned scvIdx OPM_UNUSED,
                                   unsigned timeIdx OPM_UNUSED)
@@ -1185,6 +1420,22 @@ public:
 
     const Evaluation& waterViscosityCorrection() const
     { throw std::runtime_error("waterViscosityCorrection() called but polymers are disabled"); }
+    
+    const Evaluation& polymerRelativeViscosity() const
+    { throw std::runtime_error("polymerRelativeViscosity() called but polymers are disabled"); }
+    
+    const Evaluation& emvis() const
+    { throw std::runtime_error("emvis() called but polymers are disabled"); }
+    
+    const Evaluation& epvis() const
+    { throw std::runtime_error("epvis() called but polymers are disabled"); }
+    
+    const Evaluation& ewvpol() const
+    { throw std::runtime_error("ewvpol() called but polymers are disabled"); }
+    
+    const Evaluation& shear() const
+    { throw std::runtime_error("shear() called but polymers are disabled"); }
+    
 };
 
 
@@ -1207,6 +1458,8 @@ class BlackOilPolymerExtensiveQuantities
     using ExtensiveQuantities = GetPropType<TypeTag, Properties::ExtensiveQuantities>;
     using FluidSystem = GetPropType<TypeTag, Properties::FluidSystem>;
     using GridView = GetPropType<TypeTag, Properties::GridView>;
+    
+    static constexpr bool enablePolymerMechanicalDegradation = getPropValue<TypeTag, Properties::EnablePolymerMechanicalDegradation>();
 
     static constexpr unsigned gasPhaseIdx = FluidSystem::gasPhaseIdx;
     static constexpr int dimWorld = GridView::dimensionworld;
@@ -1216,6 +1469,8 @@ class BlackOilPolymerExtensiveQuantities
     using PolymerModule = BlackOilPolymerModule<TypeTag>;
     using DimVector = Dune::FieldVector<Scalar, dimWorld>;
     using DimEvalVector = Dune::FieldVector<Evaluation, dimWorld>;
+    
+    using StashedValues = typename PolymerModule::StashedValues;
 
 public:
     /*!
@@ -1232,6 +1487,122 @@ public:
     {
         throw std::runtime_error("The extension of the blackoil model for polymers is not yet "
                                  "implemented for problems specified using permeabilities.");
+    }
+    
+    /*!
+     * \brief Method which calculates in-situ shear rate based on flow velocity
+     * 
+     * Note that this implementation is separate from the ECLIPSE approach 
+     * of using the SHRATE keyword and a corresponding shear rate factor.
+     */
+    template <class Dummy = bool> // we need to make this method a template to avoid
+    // compiler errors if it is not instantiated!
+    void calcInSituShearRate(const ElementContext& elemCtx,
+                             unsigned scvfIdx,
+                             unsigned timeIdx)
+    {
+        if(!enablePolymerMechanicalDegradation)
+        {
+            return;
+        }
+        
+        // shear factors for water and polymer are not used for this option
+        waterShearFactor_ = 1.0;
+        polymerShearFactor_ = 1.0;
+
+        const ExtensiveQuantities& extQuants = asImp_();
+        unsigned upIdx = extQuants.upstreamIndex(waterPhaseIdx);
+        unsigned interiorDofIdx = extQuants.interiorIndex();
+        unsigned exteriorDofIdx = extQuants.exteriorIndex();
+        const auto& up = elemCtx.intensiveQuantities(upIdx, timeIdx);
+        const auto& intQuantsIn = elemCtx.intensiveQuantities(interiorDofIdx, timeIdx);
+        const auto& intQuantsEx = elemCtx.intensiveQuantities(exteriorDofIdx, timeIdx);
+        
+        // compute water velocity from flux
+        Evaluation poroAvg = intQuantsIn.porosity()*0.5 + intQuantsEx.porosity()*0.5;
+        unsigned pvtnumRegionIdx = elemCtx.problem().pvtRegionIndex(elemCtx, scvfIdx, timeIdx);
+        const Evaluation& Sw = up.fluidState().saturation(waterPhaseIdx);
+        unsigned cellIdx = elemCtx.globalSpaceIndex(scvfIdx, timeIdx);
+        const auto& materialLawManager = elemCtx.problem().materialLawManager();
+        const auto& scaledDrainageInfo =
+                materialLawManager->oilWaterScaledEpsInfoDrainage(cellIdx);
+        const Scalar& Swcr = scaledDrainageInfo.Swcr;
+        
+        // guard against zero porosity and no mobile water
+        Evaluation denom = Opm::max(poroAvg * (Sw - Swcr), 1e-12); // NB!!!
+        Evaluation waterVolumeVelocity = extQuants.volumeFlux(waterPhaseIdx) / denom;
+        
+        unsigned numInteriorFaces = elemCtx.numInteriorFaces(timeIdx);
+        unsigned cellGlobalIdx = elemCtx.globalSpaceIndex(interiorDofIdx, timeIdx);
+        
+        StashedValues& stashedValues = PolymerModule::stashedValues_[cellGlobalIdx];
+        if(scvfIdx == 0) // first face
+        {
+            stashedValues.velocity = 0.0;
+            //stashedValues.distance = 0.0;
+            stashedValues.average_cell_velocity = 0.0;
+            stashedValues.cell_shear_rate = 0.0;
+            stashedValues.debug_value = 0;
+        }
+        stashedValues.velocity[scvfIdx] = waterVolumeVelocity.value();
+
+        // Compute shear rate from velocity:
+        inSituShearRate_ = 0.0;
+        
+        // CRITICAL TODO: Rel. perm. is currently < 1 even when Sw=1...
+        const Evaluation relWater = 1.0; //up.relativePermeability(waterPhaseIdx);
+        
+        // hack: currently need to (manually) edit this in TWO places....
+        const bool useCarreauYasudaModel = true;
+        const Scalar alpha_factor = useCarreauYasudaModel? 2.0 : 2.5;
+        
+        /*
+        // THIS IS NOT USED....
+        Scalar trans = elemCtx.problem().transmissibility(elemCtx, interiorDofIdx, exteriorDofIdx);
+        if (trans > 0.0) {
+             // Question: What if trans == 0 ?
+            Scalar faceArea = elemCtx.stencil(timeIdx).interiorFace(scvfIdx).area();
+            auto dist = elemCtx.pos(interiorDofIdx, timeIdx) -  elemCtx.pos(exteriorDofIdx, timeIdx);
+            // compute permeability from transmissibility.
+            const Scalar absPerm = trans / faceArea * dist.two_norm();
+            const Scalar absWaterVolumeVelocity = Opm::abs(waterVolumeVelocity.value());
+            inSituShearRate_ = absWaterVolumeVelocity*alpha_factor*Opm::sqrt(2.0*poroAvg*Sw / (relWater*absPerm));
+            assert(Opm::isfinite(inSituShearRate_));
+        }
+        */
+        
+        // TO DOs (generalize to 2D & 3D): 
+        // - How to weigh different velocities in the average?
+        // - How to adjust for directional permeabilities??
+        if (scvfIdx == numInteriorFaces - 1){ // last face for this interior cell
+            Scalar sumVelSquared = 0.0;
+            for(unsigned i=0; i < numInteriorFaces; ++i){
+                //stashedValues.debug_value = static_cast<Scalar>(numInteriorFaces);//DEBUG ONLY
+                Scalar velocity = stashedValues.velocity[i];
+                sumVelSquared += velocity*velocity;
+            }
+            const Scalar avgCellVelocity = sqrt(sumVelSquared/numInteriorFaces); // m/sec
+            
+            //Note from source code: "This method is specific to the finite volume discretizations."
+            const auto& K = elemCtx.problem().intrinsicPermeability(cellGlobalIdx); // 3x3 matrix
+            const auto Kx = K[0][0];
+            const auto Ky = K[1][1];
+            const auto Kz = K[2][2];
+            const Scalar absPermCell = Kx;
+            Scalar cellShearRate = 0.0;
+            Scalar the_rest = 0.0;
+            if(absPermCell > 0 && relWater > 0){
+                const Evaluation tmp = alpha_factor*Opm::sqrt(2.0*poroAvg*Sw / (relWater*absPermCell));
+                the_rest = tmp.value();
+                
+                const Evaluation gamma = avgCellVelocity*alpha_factor*Opm::sqrt(2.0*poroAvg*Sw / (relWater*absPermCell));
+                cellShearRate = gamma.value();
+            }
+            
+            stashedValues.average_cell_velocity = avgCellVelocity;
+            stashedValues.cell_shear_rate = cellShearRate;
+            stashedValues.debug_value = relWater.value();//avgCellVelocity; // DEBUG ONLY
+        }
     }
 
     /*!
@@ -1250,8 +1621,13 @@ public:
         waterShearFactor_ = 1.0;
         polymerShearFactor_ = 1.0;
 
-        if (!PolymerModule::hasPlyshlog())
+        if (!PolymerModule::hasPlyshlog()){
             return;
+        }
+        
+        if(enablePolymerMechanicalDegradation){
+            return;
+        }
 
         const ExtensiveQuantities& extQuants = asImp_();
         unsigned upIdx = extQuants.upstreamIndex(waterPhaseIdx);
@@ -1307,6 +1683,9 @@ public:
 
     const Evaluation& waterShearFactor() const
     { return waterShearFactor_; }
+    
+    const Evaluation& inSituShearRate() const
+    { return inSituShearRate_; }
 
 
 private:
@@ -1315,6 +1694,8 @@ private:
 
     Evaluation polymerShearFactor_;
     Evaluation waterShearFactor_;
+    
+    Evaluation inSituShearRate_;
 
 };
 
@@ -1334,12 +1715,21 @@ public:
                                     unsigned scvfIdx OPM_UNUSED,
                                     unsigned timeIdx OPM_UNUSED)
     { }
+    
+    void calcInSituShearRate(const ElementContext& elemCtx OPM_UNUSED,
+                             unsigned scvfIdx OPM_UNUSED,
+                             unsigned timeIdx OPM_UNUSED)
+    { }
 
     const Evaluation& polymerShearFactor() const
     { throw std::runtime_error("polymerShearFactor() called but polymers are disabled"); }
 
     const Evaluation& waterShearFactor() const
     { throw std::runtime_error("waterShearFactor() called but polymers are disabled"); }
+    
+    const Evaluation& inSituShearRate() const
+    { throw std::runtime_error("inSituShearRate() called but polymers are disabled"); }
+    
 };
 
 

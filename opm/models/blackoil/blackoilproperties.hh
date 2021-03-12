@@ -49,6 +49,9 @@ struct EnablePolymer { using type = UndefinedProperty; };
 //! Enable the tracking polymer molecular weight tracking and related functionalities
 template<class TypeTag, class MyTypeTag>
 struct EnablePolymerMW { using type = UndefinedProperty; };
+//! Enable model accounting for polymer mechanical degradation in the near well zone (also requires EnablePolymerMW)
+template<class TypeTag, class MyTypeTag>
+struct EnablePolymerMechanicalDegradation { using type = UndefinedProperty; };
 //! Enable surface volume scaling
 template<class TypeTag, class MyTypeTag>
 struct BlackoilConserveSurfaceVolume { using type = UndefinedProperty; };

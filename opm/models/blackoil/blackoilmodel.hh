@@ -152,6 +152,8 @@ struct EnablePolymer<TypeTag, TTag::BlackOilModel> { static constexpr bool value
 template<class TypeTag>
 struct EnablePolymerMW<TypeTag, TTag::BlackOilModel> { static constexpr bool value = false; };
 template<class TypeTag>
+struct EnablePolymerMechanicalDegradation<TypeTag, TTag::BlackOilModel> { static constexpr bool value = false; };
+template<class TypeTag>
 struct EnableFoam<TypeTag, TTag::BlackOilModel> { static constexpr bool value = false; };
 template<class TypeTag>
 struct EnableBrine<TypeTag, TTag::BlackOilModel> { static constexpr bool value = false; };
