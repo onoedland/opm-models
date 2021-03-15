@@ -940,6 +940,93 @@ public:
         return Opm::exp(logShearEffectMultiplier.eval(u, /*extrapolate=*/true));
 
     }
+    
+    
+    template <class Evaluation>
+    static Evaluation calcPolymerApparentViscosityForMechanicalDegradationModel(const ElementContext& elemCtx, 
+                                                                                unsigned dofIdx, 
+                                                                                unsigned timeIdx,
+                                                                                const Evaluation& polymerConcentration,
+                                                                                const Evaluation& molecularWeight,
+                                                                                const Scalar& shearRate,
+                                                                                const Evaluation& muWater,
+                                                                                const Evaluation& Sw,
+                                                                                const Evaluation& relWater)
+    {
+        const bool isPolymer = (polymerConcentration > 1.0e-12) ? true : false;
+        if(!isPolymer){
+            return Evaluation(muWater);
+        }
+        
+        const Scalar porosity = elemCtx.problem().porosity(elemCtx, dofIdx, timeIdx);
+        const Scalar temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
+
+        const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, dofIdx, timeIdx);
+        const auto& plyvmhCoefficients = plyvmhCoefficients_[polymerMixRegionIdx];
+        //const auto& plyvmhCoefficients = PolymerModule::plyvmhCoefficients(elemCtx, dofIdx, timeIdx);
+        const Scalar k_mh = plyvmhCoefficients.k_mh;
+        const Scalar a_mh = plyvmhCoefficients.a_mh;
+        
+        // hack: currently this must be manually updated in TWO different places..!!!
+        const bool useCarreauYasudaModel = true;
+        
+        Scalar huggins1 = 0.4;
+        Scalar huggins2 = 0.1;
+        if(useCarreauYasudaModel){
+            huggins1 = 0.01;
+            huggins2 = 0.077;
+        }
+        const Scalar pow_x = 1.0;
+        
+        const Evaluation Mw(molecularWeight * 1000.); // kg/mol ---> g/mol
+
+        const Evaluation intrinsicViscosity(k_mh * Opm::pow(Mw, a_mh));
+        const Evaluation x(polymerConcentration * intrinsicViscosity);
+        const Evaluation specificViscosityAtZeroShearRate(x*(1 + x*(huggins1 + huggins2*x))); // x + k1*x^2 + k2*x^3
+        
+        const Scalar lambda_a = 0.350;
+        const Scalar a_n = 0.063;
+        const Scalar b_n = 0.804;
+        
+        // Calculate Carreau-Yasuda parameters:
+        const Evaluation pow_n(1.0 - 1.0/(1.0+pow(a_n*x, b_n)));
+        
+        // note: lam1_ICS (Lohne et al. 2017) = (lam1_OPM * 1.07)*(1.0+2.5*0.0015) when using muWater=1.0 and cpol=1.5 kg/m3
+        const Evaluation lambda1((lambda_a*muWater*specificViscosityAtZeroShearRate*Mw)/(polymerConcentration*temperature));
+        
+        const Scalar gamma_hf = 20.0; // 1/sec
+        const Scalar p_alpha = 1.75;
+        
+        Evaluation shearThinningSpecificViscosity = 0.0;
+        if(useCarreauYasudaModel){
+            shearThinningSpecificViscosity = specificViscosityAtZeroShearRate*pow(1+pow(lambda1*shearRate, pow_x), -pow_n/pow_x);
+        }
+        else{
+            // Meter's model:
+            shearThinningSpecificViscosity = specificViscosityAtZeroShearRate / (1.0 + pow(shearRate/gamma_hf, p_alpha - 1.0));
+        }
+    
+        // Elongation & degradation parameters:
+        const Scalar critical_Deborah_number = 0.5; // el_lamf = 2.0 / N_De
+        const Scalar el_m2 = 1.5;
+        const Scalar el_x2 = 2.0;
+        
+        const Scalar gas_constant = 8.31446261815324; // J/K/mol
+        const Scalar pre_factor = 3.0/(5.0*gas_constant*critical_Deborah_number);
+        // Note (9/5-2019): pre_factor includes effect of oil being present on lambda2.
+        const Evaluation fac_k_Sw = (Sw > 0) ? (relWater / Sw) : relWater;
+        // TO DO: Add ipv and/or further Sw correction here??
+        const Evaluation volume_factor = Opm::sqrt(fac_k_Sw)* porosity / (1. - porosity);
+        // note: lam2_ICS (Lohne et al. 2017) = (lam2_OPM * 1.07)*(1.0+2.5*0.0015) when using muWater=1.0 and cpol=1.5 kg/m3
+        const Evaluation lambda2 = pre_factor*volume_factor*muWater*intrinsicViscosity*Mw/temperature;
+        const Evaluation t_exp = (el_m2 + pow_n) /  el_x2;
+        const Evaluation elongationFactor = Opm::pow(1.0 + Opm::pow(lambda2 * shearRate, el_x2), t_exp);
+        
+        // NOTE: Only shear-thinning is included at the moment!
+        const Evaluation specificViscosity = shearThinningSpecificViscosity; // *elongationFactor;
+        Evaluation relativeViscosity = 1.0 + specificViscosity;
+        return muWater*relativeViscosity;
+    }
 
     const Scalar molarMass() const
     {
@@ -1171,7 +1258,7 @@ public:
             const Evaluation relWater = 1.0; // TO DO: Get rel.perm. of water also?
             const Evaluation& muWater = fs.viscosity(waterPhaseIdx);
             const Evaluation& Sw = fs.saturation(waterPhaseIdx);
-            
+            /*
             const Scalar porosity = elemCtx.problem().porosity(elemCtx, dofIdx, timeIdx);
             const Scalar temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
             
@@ -1266,6 +1353,41 @@ public:
             epvis_ = shearThinningSpecificViscosity*elongationFactor;
             eta_rel_ = relativeViscosity;
             shear_rate_ = shear_rate;
+            */
+            
+            // DEBUG ONLY:
+            Scalar shear_rate = 0.0;
+            unsigned globalSpaceIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
+            if(!PolymerModule::stashedValues_.empty()){
+                StashedValues& stashedValues = PolymerModule::stashedValues_[globalSpaceIdx];
+                unsigned cellGlobalIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
+                shear_rate = stashedValues.cell_shear_rate;
+                
+                // TO DO: just for testing....
+                epvis_ = stashedValues.debug_value;
+                
+            }
+            
+            const Evaluation& apparentViscosity = PolymerModule::calcPolymerApparentViscosityForMechanicalDegradationModel(elemCtx, 
+                                                                                                                           dofIdx, 
+                                                                                                                           timeIdx, 
+                                                                                                                           //polymerMixRegionIdx,
+                                                                                                                           polymerConcentration_,
+                                                                                                                           polymerMoleWeight_,
+                                                                                                                           shear_rate,
+                                                                                                                           muWater,
+                                                                                                                           Sw,
+                                                                                                                           relWater);
+            const Evaluation relativeViscosity = apparentViscosity / muWater;                                              
+            waterViscosityCorrection_ = 1.0 / relativeViscosity;
+            polymerViscosityCorrection_ = 1.0;
+
+            //emvis_ = lambda2;
+            //epvis_ = shearThinningSpecificViscosity*elongationFactor;
+            eta_rel_ = relativeViscosity;
+            shear_rate_ = shear_rate;
+            //std::cout << "Viscosity=" << 1.0e3*visc << " mPas\n.";
+            
             
         }
         else { // based on PLYVMH
@@ -1592,9 +1714,6 @@ public:
             Scalar cellShearRate = 0.0;
             Scalar the_rest = 0.0;
             if(absPermCell > 0 && relWater > 0){
-                const Evaluation tmp = alpha_factor*Opm::sqrt(2.0*poroAvg*Sw / (relWater*absPermCell));
-                the_rest = tmp.value();
-                
                 const Evaluation gamma = avgCellVelocity*alpha_factor*Opm::sqrt(2.0*poroAvg*Sw / (relWater*absPermCell));
                 cellShearRate = gamma.value();
             }
