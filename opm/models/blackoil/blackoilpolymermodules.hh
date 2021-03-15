@@ -941,7 +941,7 @@ public:
 
     }
     
-    // TO DO: How many, and which, of the input arguments should be Evaluations ?
+    // TO DO: How many, and which, of the input arguments should be Evaluations ? (EvalWell)
     template <class Evaluation>
     static Evaluation computeWellShearRate(const Evaluation& darcyVelocityWell,
                                            const Scalar absolutePermeability,
@@ -956,14 +956,15 @@ public:
     // TO DO: How many, and which, of the input arguments should be Evaluations ?
     template <class Evaluation>
     static Evaluation calcPolymerApparentViscosityForMechanicalDegradationModel(const Evaluation& polymerConcentration,
-                                                                                const Evaluation& molecularWeight,
+                                                                                const Evaluation& Mw,
                                                                                 unsigned polymerMixRegionIdx,
-                                                                                const Scalar& shearRate,
+                                                                                const Evaluation& shearRate,
                                                                                 const Evaluation& muWater,
                                                                                 const Scalar& porosity,
                                                                                 const Scalar& temperature,
                                                                                 const Evaluation& Sw,
-                                                                                const Evaluation& relWater)
+                                                                                const Evaluation& relWater,
+                                                                                bool elongation=false)
     {
         const bool isPolymer = (polymerConcentration > 1.0e-12) ? true : false;
         if(!isPolymer){
@@ -983,9 +984,6 @@ public:
             huggins2 = 0.077;
         }
         const Scalar pow_x = 1.0;
-        
-        const Evaluation Mw(molecularWeight * 1000.); // kg/mol ---> g/mol
-
         const Evaluation intrinsicViscosity(k_mh * Opm::pow(Mw, a_mh));
         const Evaluation x(polymerConcentration * intrinsicViscosity);
         const Evaluation specificViscosityAtZeroShearRate(x*(1 + x*(huggins1 + huggins2*x))); // x + k1*x^2 + k2*x^3
@@ -1003,35 +1001,39 @@ public:
         const Scalar gamma_hf = 20.0; // 1/sec
         const Scalar p_alpha = 1.75;
         
-        Evaluation shearThinningSpecificViscosity = 0.0;
+        Evaluation shearThinningSpecificViscosity(1.0);
         if(useCarreauYasudaModel){
-            shearThinningSpecificViscosity = specificViscosityAtZeroShearRate*pow(1+pow(lambda1*shearRate, pow_x), -pow_n/pow_x);
+            shearThinningSpecificViscosity *= specificViscosityAtZeroShearRate*pow(1+pow(lambda1*shearRate, pow_x), -pow_n/pow_x);
         }
         else{
             // Meter's model:
-            shearThinningSpecificViscosity = specificViscosityAtZeroShearRate / (1.0 + pow(shearRate/gamma_hf, p_alpha - 1.0));
+            shearThinningSpecificViscosity *= specificViscosityAtZeroShearRate / (1.0 + pow(shearRate/gamma_hf, p_alpha - 1.0));
         }
-    
-        // Elongation & degradation parameters:
-        const Scalar critical_Deborah_number = 0.5; // el_lamf = 2.0 / N_De
-        const Scalar el_m2 = 1.5;
-        const Scalar el_x2 = 2.0;
+        Evaluation specificViscosity = shearThinningSpecificViscosity;
         
-        const Scalar gas_constant = 8.31446261815324; // J/K/mol
-        const Scalar pre_factor = 3.0/(5.0*gas_constant*critical_Deborah_number);
-        // Note (9/5-2019): pre_factor includes effect of oil being present on lambda2.
-        const Evaluation fac_k_Sw = (Sw > 0) ? (relWater / Sw) : relWater;
-        // TO DO: Add ipv and/or further Sw correction here??
-        const Evaluation volume_factor = Opm::sqrt(fac_k_Sw)* porosity / (1. - porosity);
-        // note: lam2_ICS (Lohne et al. 2017) = (lam2_OPM * 1.07)*(1.0+2.5*0.0015) when using muWater=1.0 and cpol=1.5 kg/m3
-        const Evaluation lambda2 = pre_factor*volume_factor*muWater*intrinsicViscosity*Mw/temperature;
-        const Evaluation t_exp = (el_m2 + pow_n) /  el_x2;
-        const Evaluation elongationFactor = Opm::pow(1.0 + Opm::pow(lambda2 * shearRate, el_x2), t_exp);
+        if(elongation){
+            const Scalar critical_Deborah_number = 0.5; // el_lamf = 2.0 / N_De
+            const Scalar el_m2 = 1.5;
+            const Scalar el_x2 = 2.0;
+            const Scalar gas_constant = 8.31446261815324; // J/K/mol
+            const Scalar pre_factor = 3.0/(5.0*gas_constant*critical_Deborah_number);
+            // Note (9/5-2019): pre_factor includes effect of oil being present on lambda2.
+            Evaluation fac_k_Sw = relWater;
+            if(Sw > 0){
+                fac_k_Sw /= Sw;
+            }
+            // TO DO: Add ipv and/or further Sw correction here??
+            const Evaluation volume_factor(Opm::sqrt(fac_k_Sw)* porosity / (1. - porosity));
+            // note: lam2_ICS (Lohne et al. 2017) = (lam2_OPM * 1.07)*(1.0+2.5*0.0015) when using muWater=1.0 and cpol=1.5 kg/m3
+            const Evaluation lambda2(pre_factor*volume_factor*muWater*intrinsicViscosity*Mw/temperature);
+            const Evaluation t_exp((el_m2 + pow_n) /  el_x2);
+            const Evaluation elongationFactor(Opm::pow(1.0 + Opm::pow(lambda2 * shearRate, el_x2), t_exp));
+            specificViscosity *= elongationFactor;
+        }
         
-        // NOTE: Only shear-thinning is included at the moment!
-        const Evaluation specificViscosity = shearThinningSpecificViscosity; // *elongationFactor;
-        Evaluation relativeViscosity = 1.0 + specificViscosity;
+        Evaluation relativeViscosity(1.0 + specificViscosity);
         return muWater*relativeViscosity;
+        
     }
 
     const Scalar molarMass() const
@@ -1362,7 +1364,7 @@ public:
             */
             
             // DEBUG ONLY:
-            Scalar shear_rate = 0.0;
+            Evaluation shear_rate = 0.0;
             unsigned globalSpaceIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
             if(!PolymerModule::stashedValues_.empty()){
                 StashedValues& stashedValues = PolymerModule::stashedValues_[globalSpaceIdx];
@@ -1377,7 +1379,7 @@ public:
             const Scalar temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
             const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, dofIdx, timeIdx);
             const Evaluation& apparentViscosity = PolymerModule::calcPolymerApparentViscosityForMechanicalDegradationModel(polymerConcentration_,
-                                                                                                                           polymerMoleWeight_,
+                                                                                                                           polymerMoleWeight_*1.0e3,  // --> kg/mol
                                                                                                                            polymerMixRegionIdx,
                                                                                                                            shear_rate,
                                                                                                                            muWater,
