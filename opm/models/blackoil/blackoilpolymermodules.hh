@@ -941,15 +941,27 @@ public:
 
     }
     
-    
+    // TO DO: How many, and which, of the input arguments should be Evaluations ?
     template <class Evaluation>
-    static Evaluation calcPolymerApparentViscosityForMechanicalDegradationModel(const ElementContext& elemCtx, 
-                                                                                unsigned dofIdx, 
-                                                                                unsigned timeIdx,
-                                                                                const Evaluation& polymerConcentration,
+    static Evaluation computeWellShearRate(const Evaluation& darcyVelocityWell,
+                                           const Scalar absolutePermeability,
+                                           const Scalar porosity,
+                                           const Evaluation& Sw,
+                                           const Evaluation& relWater,
+                                           const Scalar alphaFactor)
+    {
+        return  (4.0*alphaFactor*darcyVelocityWell)/(Opm::sqrt(8.0*relWater*absolutePermeability*porosity*Sw));
+    }
+    
+    // TO DO: How many, and which, of the input arguments should be Evaluations ?
+    template <class Evaluation>
+    static Evaluation calcPolymerApparentViscosityForMechanicalDegradationModel(const Evaluation& polymerConcentration,
                                                                                 const Evaluation& molecularWeight,
+                                                                                unsigned polymerMixRegionIdx,
                                                                                 const Scalar& shearRate,
                                                                                 const Evaluation& muWater,
+                                                                                const Scalar& porosity,
+                                                                                const Scalar& temperature,
                                                                                 const Evaluation& Sw,
                                                                                 const Evaluation& relWater)
     {
@@ -957,13 +969,7 @@ public:
         if(!isPolymer){
             return Evaluation(muWater);
         }
-        
-        const Scalar porosity = elemCtx.problem().porosity(elemCtx, dofIdx, timeIdx);
-        const Scalar temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
-
-        const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, dofIdx, timeIdx);
         const auto& plyvmhCoefficients = plyvmhCoefficients_[polymerMixRegionIdx];
-        //const auto& plyvmhCoefficients = PolymerModule::plyvmhCoefficients(elemCtx, dofIdx, timeIdx);
         const Scalar k_mh = plyvmhCoefficients.k_mh;
         const Scalar a_mh = plyvmhCoefficients.a_mh;
         
@@ -1365,17 +1371,18 @@ public:
                 
                 // TO DO: just for testing....
                 epvis_ = stashedValues.debug_value;
-                
             }
             
-            const Evaluation& apparentViscosity = PolymerModule::calcPolymerApparentViscosityForMechanicalDegradationModel(elemCtx, 
-                                                                                                                           dofIdx, 
-                                                                                                                           timeIdx, 
-                                                                                                                           //polymerMixRegionIdx,
-                                                                                                                           polymerConcentration_,
+            const Scalar porosity = elemCtx.problem().porosity(elemCtx, dofIdx, timeIdx);
+            const Scalar temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
+            const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, dofIdx, timeIdx);
+            const Evaluation& apparentViscosity = PolymerModule::calcPolymerApparentViscosityForMechanicalDegradationModel(polymerConcentration_,
                                                                                                                            polymerMoleWeight_,
+                                                                                                                           polymerMixRegionIdx,
                                                                                                                            shear_rate,
                                                                                                                            muWater,
+                                                                                                                           porosity,
+                                                                                                                           temperature,
                                                                                                                            Sw,
                                                                                                                            relWater);
             const Evaluation relativeViscosity = apparentViscosity / muWater;                                              
@@ -1387,8 +1394,6 @@ public:
             eta_rel_ = relativeViscosity;
             shear_rate_ = shear_rate;
             //std::cout << "Viscosity=" << 1.0e3*visc << " mPas\n.";
-            
-            
         }
         else { // based on PLYVMH
             const auto& plyvmhCoefficients = PolymerModule::plyvmhCoefficients(elemCtx, dofIdx, timeIdx);
