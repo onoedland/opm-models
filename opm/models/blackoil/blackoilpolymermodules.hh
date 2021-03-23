@@ -993,28 +993,32 @@ public:
         const Scalar b_n = 0.804;
         
         // Calculate Carreau-Yasuda parameters:
-        const Evaluation pow_n(1.0 - 1.0/(1.0+pow(a_n*x, b_n)));
+        
+        const Evaluation pow_n = 1.0 - Opm::pow(1.0 + Opm::pow(a_n * x, b_n), -1.0); // NOTE: pow([], -1) == 1/[]
+        //const Evaluation pow_n(1.0 - 1.0/(1.0+pow(a_n*x, b_n)));
         
         // note: lam1_ICS (Lohne et al. 2017) = (lam1_OPM * 1.07)*(1.0+2.5*0.0015) when using muWater=1.0 and cpol=1.5 kg/m3
         const Evaluation lambda1((lambda_a*muWater*specificViscosityAtZeroShearRate*Mw)/(polymerConcentration*temperature));
         
         const Scalar gamma_hf = 20.0; // 1/sec
         const Scalar p_alpha = 1.75;
-        
-        Evaluation shearThinningSpecificViscosity(1.0);
+
+        // hack. Should really set to zero here, but need it to work for both Evaluation & EvalWell...
+        Evaluation shearThinningSpecificViscosity = intrinsicViscosity;
         if(useCarreauYasudaModel){
-            shearThinningSpecificViscosity *= specificViscosityAtZeroShearRate*pow(1+pow(lambda1*shearRate, pow_x), -pow_n/pow_x);
+            shearThinningSpecificViscosity = specificViscosityAtZeroShearRate*Opm::pow(1+Opm::pow(lambda1*shearRate, pow_x), -pow_n/pow_x);
         }
         else{
             // Meter's model:
-            shearThinningSpecificViscosity *= specificViscosityAtZeroShearRate / (1.0 + pow(shearRate/gamma_hf, p_alpha - 1.0));
+            shearThinningSpecificViscosity = specificViscosityAtZeroShearRate / (1.0 + Opm::pow(shearRate/gamma_hf, p_alpha - 1.0));
         }
         Evaluation specificViscosity = shearThinningSpecificViscosity;
         
         if(elongation){
             const Scalar critical_Deborah_number = 0.5; // el_lamf = 2.0 / N_De
             const Scalar el_m2 = 1.5;
-            const Scalar el_x2 = 2.0;
+            const Scalar el_x2 = 3.0;
+            // Used in som old code: R= 8.314459848
             const Scalar gas_constant = 8.31446261815324; // J/K/mol
             const Scalar pre_factor = 3.0/(5.0*gas_constant*critical_Deborah_number);
             // Note (9/5-2019): pre_factor includes effect of oil being present on lambda2.
@@ -1336,7 +1340,7 @@ public:
             // Elongation & degradation parameters:
             const Scalar critical_Deborah_number = 0.5; // el_lamf = 2.0 / N_De
             const Scalar el_m2 = 1.5;
-            const Scalar el_x2 = 2.0;
+            const Scalar el_x2 = 3.0;
             
             const Scalar gas_constant = 8.31446261815324; // J/K/mol
             const Scalar pre_factor = 3.0/(5.0*gas_constant*critical_Deborah_number);
@@ -1387,7 +1391,8 @@ public:
                                                                                                                            temperature,
                                                                                                                            Sw,
                                                                                                                            relWater);
-            const Evaluation relativeViscosity = apparentViscosity / muWater;                                              
+                                                                                                                           
+            const Evaluation relativeViscosity = apparentViscosity / muWater;                           
             waterViscosityCorrection_ = 1.0 / relativeViscosity;
             polymerViscosityCorrection_ = 1.0;
 
