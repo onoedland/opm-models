@@ -112,7 +112,18 @@ public:
         Scalar kappa;
     };
     
+    // A struct containing constants to calculate low-shear polymer viscosity when
+    // using POLYMW + mechanical degradation model
+    // (includes calculation of intrinsic viscosity from the Mark-Houwink equation)
     //
+    // Note: There is some overlap with PlyvmhCoefficients...
+    struct PlylowshParameters {
+        Scalar k_mh;
+        Scalar a_mh;
+        Scalar k1;
+        Scalar k2;
+    };
+    
     // A struct with constants used to calculate shear-thinning viscosity for the
     // Carreau-Yasuda model (i.e., as a function of both molecular weight and shear rate ++)
     struct PlycarrParameters{
@@ -235,10 +246,16 @@ public:
         // initialize the objects which deal with the PLYVISC keyword
         const auto& plyviscTables = tableManager.getPlyviscTables();
         if (!plyviscTables.empty()) {
-            // different viscosity model is used for POLYMW
+            // different viscosity model(s) are used for POLYMW
             if (enablePolymerMolarWeight && !enablePolymerMechanicalDegradation) {
                 Opm::OpmLog::warning("PLYVISC should not be used in POLYMW runs, "
                                      "it will have no effect. A viscosity model based on PLYVMH is used instead.\n");
+            }
+            else if(enablePolymerMolarWeight && enablePolymerMechanicalDegradation){
+                Opm::OpmLog::warning("PLYVISC should not be used in mechanical degradation runs, "
+                                     "it will have no effect. A viscosity model based on the PLYLOWSH and PLYCARR keywords is used instead.\n");
+                                     
+                Opm::OpmLog::warning("Using experimental mechanical degradation model...\n");
             }
             else {
                 assert(numPvtRegions == plyviscTables.size());
@@ -250,12 +267,6 @@ public:
                     plyviscViscosityMultiplierTable_[pvtRegionIdx].setXYContainers(c, visc);
                 }
             }
-            
-            if(enablePolymerMolarWeight && enablePolymerMechanicalDegradation)
-            {
-                Opm::OpmLog::warning("Using experimental mechanical degradation model...\n");
-            }
-            
         }
         else if (!enablePolymerMolarWeight) {
             throw std::runtime_error("PLYVISC must be specified in POLYMER runs\n");
@@ -357,7 +368,7 @@ public:
             }
         }
 
-        if (enablePolymerMolarWeight) { // include for both kinds of POLYMW models
+        if (enablePolymerMolarWeight && !enablePolymerMechanicalDegradation) {
             const auto& plyvmhTable = eclState.getTableManager().getPlyvmhTable();
             if(plyvmhTable.empty()){
                 throw std::runtime_error("PLYVMH keyword must be specified in POLYMW runs \n");
@@ -371,45 +382,59 @@ public:
                     plyvmhCoefficients_[regionIdx].kappa = plyvmhTable[regionIdx].kappa;
                 }
             }
-            
+        }
+        
+        else if (enablePolymerMolarWeight && enablePolymerMechanicalDegradation) {
             // QUESTION (TO DO): Should we rename "POLYDEGR" to PLY_something, and use the POLYDEGR keyword to activate the model itself??
-            if(enablePolymerMechanicalDegradation){
-                
-                const auto& plycarrTable = eclState.getTableManager().getPlycarrTable();
-                if(plycarrTable.empty()){
-                    // QUESTION (TO DO): Also allow Meter's model? How should we select different shear thinning models at run time?
-                    throw std::runtime_error("PLYCARR keyword must be specified in mechanical degradation model runs \n");
+            
+            const auto& plylowshTable = eclState.getTableManager().getPlylowshTable();
+            if(plylowshTable.empty()){
+                throw std::runtime_error("PLYLOWSH keyword must be specified in mechanical degradation model runs \n");
+            }
+            else{
+                assert(plylowshTable.size() == numMixRegions);
+                for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
+                    plylowshParameters_[regionIdx].k_mh = plylowshTable[regionIdx].k_mh;
+                    plylowshParameters_[regionIdx].a_mh = plylowshTable[regionIdx].a_mh;
+                    plylowshParameters_[regionIdx].k1 = plylowshTable[regionIdx].k1;
+                    plylowshParameters_[regionIdx].k2 = plylowshTable[regionIdx].k2;
                 }
-                else{
-                    assert(plycarrTable.size() == numMixRegions);
-                    for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
-                        plycarrParameters_[regionIdx].a_n = plycarrTable[regionIdx].a_n;
-                        plycarrParameters_[regionIdx].b_n = plycarrTable[regionIdx].b_n;
-                        plycarrParameters_[regionIdx].lam_a = plycarrTable[regionIdx].lam_a;
-                        plycarrParameters_[regionIdx].lam_b = plycarrTable[regionIdx].lam_b;
-                        plycarrParameters_[regionIdx].x = plycarrTable[regionIdx].x;
-                    }
+            }
+            
+            const auto& plycarrTable = eclState.getTableManager().getPlycarrTable();
+            if(plycarrTable.empty()){
+                // QUESTION (TO DO): Also allow Meter's model? How should we select different shear thinning models at run time?
+                throw std::runtime_error("PLYCARR keyword must be specified in mechanical degradation model runs \n");
+            }
+            else{
+                assert(plycarrTable.size() == numMixRegions);
+                for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
+                    plycarrParameters_[regionIdx].a_n = plycarrTable[regionIdx].a_n;
+                    plycarrParameters_[regionIdx].b_n = plycarrTable[regionIdx].b_n;
+                    plycarrParameters_[regionIdx].lam_a = plycarrTable[regionIdx].lam_a;
+                    plycarrParameters_[regionIdx].lam_b = plycarrTable[regionIdx].lam_b;
+                    plycarrParameters_[regionIdx].x = plycarrTable[regionIdx].x;
                 }
-                
-                const auto& polydegrTable = eclState.getTableManager().getPolydegrTable();
-                if(polydegrTable.empty()){
-                    throw std::runtime_error("POLYDEGR keyword must be specified in mechanical degradation model runs \n");
-                }
-                else{
-                    assert(polydegrTable.size() == numMixRegions);
-                    for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
-                        polydegrParameters_[regionIdx].N_De = polydegrTable[regionIdx].N_De;
-                        polydegrParameters_[regionIdx].el_m = polydegrTable[regionIdx].el_m;
-                        polydegrParameters_[regionIdx].el_x = polydegrTable[regionIdx].el_x;
-                        polydegrParameters_[regionIdx].rdeg = polydegrTable[regionIdx].rdeg;
-                        polydegrParameters_[regionIdx].alpha = polydegrTable[regionIdx].alpha;
-                        polydegrParameters_[regionIdx].beta = polydegrTable[regionIdx].beta;
-                    }
+            }
+            
+            const auto& polydegrTable = eclState.getTableManager().getPolydegrTable();
+            if(polydegrTable.empty()){
+                throw std::runtime_error("POLYDEGR keyword must be specified in mechanical degradation model runs \n");
+            }
+            else{
+                assert(polydegrTable.size() == numMixRegions);
+                for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
+                    polydegrParameters_[regionIdx].N_De = polydegrTable[regionIdx].N_De;
+                    polydegrParameters_[regionIdx].el_m = polydegrTable[regionIdx].el_m;
+                    polydegrParameters_[regionIdx].el_x = polydegrTable[regionIdx].el_x;
+                    polydegrParameters_[regionIdx].rdeg = polydegrTable[regionIdx].rdeg;
+                    polydegrParameters_[regionIdx].alpha = polydegrTable[regionIdx].alpha;
+                    polydegrParameters_[regionIdx].beta = polydegrTable[regionIdx].beta;
                 }
             }
         }
         
-        if (enablePolymerMolarWeight){
+        if (enablePolymerMolarWeight){ // TO DO: This should eventually not be used with new degradation model...
             
             // handling PLYMWINJ keyword
             const auto& plymwinjTables = tableManager.getPlymwinjTables();
@@ -517,12 +542,13 @@ public:
         plymaxMaxConcentration_.resize(numRegions);
         plymixparToddLongstaff_.resize(numRegions);
 
-        if (enablePolymerMolarWeight) {
-            plyvmhCoefficients_.resize(numRegions);
-            if(enablePolymerMechanicalDegradation){
+        if (enablePolymerMolarWeight && enablePolymerMechanicalDegradation) {
+                plylowshParameters_.resize(numRegions);
                 plycarrParameters_.resize(numRegions);
                 polydegrParameters_.resize(numRegions);
-            }
+        }
+        else if(enablePolymerMolarWeight){
+            plyvmhCoefficients_.resize(numRegions);
         }
     }
 
@@ -895,14 +921,6 @@ public:
         unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
         return plymixparToddLongstaff_[polymerMixRegionIdx];
     }
-    
-    static const PlycarrParameters& plycarrParameters(const ElementContext& elemCtx,
-                                                      const unsigned scvIdx,
-                                                      const unsigned timeIdx)
-    {
-        const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
-        return plycarrParameters_[polymerMixRegionIdx];
-    }
 
     static const PlyvmhCoefficients& plyvmhCoefficients(const ElementContext& elemCtx,
                                                         const unsigned scvIdx,
@@ -910,6 +928,22 @@ public:
     {
         const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
         return plyvmhCoefficients_[polymerMixRegionIdx];
+    }
+    
+    static const PlylowshParameters& plylowshParameters(const ElementContext& elemCtx,
+                                                        const unsigned scvIdx,
+                                                        const unsigned timeIdx)
+    {
+        const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
+        return plylowshParameters_[polymerMixRegionIdx];
+    }
+    
+    static const PlycarrParameters& plycarrParameters(const ElementContext& elemCtx,
+                                                      const unsigned scvIdx,
+                                                      const unsigned timeIdx)
+    {
+        const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
+        return plycarrParameters_[polymerMixRegionIdx];
     }
     
     static const PolydegrParameters& polydegrParameters(const ElementContext& elemCtx,
@@ -1045,9 +1079,9 @@ public:
             return Evaluation(muWater);
         }
         
-        const auto& plyvmhCoefficients = plyvmhCoefficients_[polymerMixRegionIdx];
-        const Scalar k_mh = plyvmhCoefficients.k_mh;
-        const Scalar a_mh = plyvmhCoefficients.a_mh;
+        const auto& plylowshParameters = plylowshParameters_[polymerMixRegionIdx];
+        const Scalar k_mh = plylowshParameters.k_mh;
+        const Scalar a_mh = plylowshParameters.a_mh;
         
         const auto& plycarrParameters = plycarrParameters_[polymerMixRegionIdx];
         // hack: currently this must be manually updated in TWO different places..!!!
@@ -1056,8 +1090,8 @@ public:
         Scalar huggins1 = 0.4;
         Scalar huggins2 = 0.1;
         if(useCarreauYasudaModel){
-            huggins1 = 0.01;
-            huggins2 = 0.077;
+            huggins1 = plylowshParameters.k1;
+            huggins2 = plylowshParameters.k2;
         }
         const Scalar pow_x = plycarrParameters.x;
         const Evaluation intrinsicViscosity(k_mh * Opm::pow(Mw, a_mh));
@@ -1143,8 +1177,9 @@ private:
     static bool hasShrate_;
     static bool hasPlyshlog_;
 
-    static std::vector<PlycarrParameters> plycarrParameters_;
     static std::vector<PlyvmhCoefficients> plyvmhCoefficients_;
+    static std::vector<PlylowshParameters> plylowshParameters_;
+    static std::vector<PlycarrParameters> plycarrParameters_;
     static std::vector<PolydegrParameters> polydegrParameters_;
     static std::map<int, TabulatedTwoDFunction> plymwinjTables_;
     static std::map<int, TabulatedTwoDFunction> skprwatTables_;
@@ -1211,12 +1246,16 @@ bool
 BlackOilPolymerModule<TypeTag, enablePolymerV>::hasPlyshlog_;
 
 template <class TypeTag, bool enablePolymerV>
-std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlycarrParameters>
-BlackOilPolymerModule<TypeTag, enablePolymerV>::plycarrParameters_;
-
-template <class TypeTag, bool enablePolymerV>
 std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlyvmhCoefficients>
 BlackOilPolymerModule<TypeTag, enablePolymerV>::plyvmhCoefficients_;
+
+template <class TypeTag, bool enablePolymerV>
+std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlylowshParameters>
+BlackOilPolymerModule<TypeTag, enablePolymerV>::plylowshParameters_;
+
+template <class TypeTag, bool enablePolymerV>
+std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlycarrParameters>
+BlackOilPolymerModule<TypeTag, enablePolymerV>::plycarrParameters_;
 
 template <class TypeTag, bool enablePolymerV>
 std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PolydegrParameters>
