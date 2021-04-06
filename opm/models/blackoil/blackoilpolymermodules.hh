@@ -103,11 +103,24 @@ public:
     // a struct containing the constants to calculate polymer viscosity
     // based on Mark-Houwink equation and Huggins equation, the constants are provided
     // by the keyword PLYVMH
+    //
+    // Note that for the second POLYMW option, kappa and gamma are unused
     struct PlyvmhCoefficients {
         Scalar k_mh;
         Scalar a_mh;
         Scalar gamma;
         Scalar kappa;
+    };
+    
+    // A struct with constants used for computing shear-thickening and degradation in
+    // second POLYMW option
+    struct PolydegrParameters{
+        Scalar N_De;
+        Scalar el_m;
+        Scalar el_x;
+        Scalar rdeg;
+        Scalar alpha;
+        Scalar beta;
     };
     
     struct StashedValues {
@@ -347,6 +360,21 @@ public:
             else {
                 throw std::runtime_error("PLYVMH keyword must be specified in POLYMW runs \n");
             }
+            
+            if(enablePolymerMechanicalDegradation){
+                const auto& polydegrTable = eclState.getTableManager().getPolydegrTable();
+                if(!polydegrTable.empty()){
+                    assert(polydegrTable.size() == numMixRegions);
+                    for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
+                        polydegrParameters_[regionIdx].N_De = polydegrTable[regionIdx].N_De;
+                        polydegrParameters_[regionIdx].el_m = polydegrTable[regionIdx].el_m;
+                        polydegrParameters_[regionIdx].el_x = polydegrTable[regionIdx].el_x;
+                        polydegrParameters_[regionIdx].rdeg = polydegrTable[regionIdx].rdeg;
+                        polydegrParameters_[regionIdx].alpha = polydegrTable[regionIdx].alpha;
+                        polydegrParameters_[regionIdx].beta = polydegrTable[regionIdx].beta;
+                    }
+                }
+            }
         }
         
         if (enablePolymerMolarWeight){
@@ -465,6 +493,9 @@ public:
 
         if (enablePolymerMolarWeight) {
             plyvmhCoefficients_.resize(numRegions);
+            if(enablePolymerMechanicalDegradation){
+                polydegrParameters_.resize(numRegions);
+            }
         }
     }
 
@@ -845,6 +876,14 @@ public:
         const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
         return plyvmhCoefficients_[polymerMixRegionIdx];
     }
+    
+    static const PolydegrParameters& polydegrParameters(const ElementContext& elemCtx,
+                                                        const unsigned scvIdx,
+                                                        const unsigned timeIdx)
+    {
+        const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
+        return polydegrParameters_[polymerMixRegionIdx];
+    }
 
     static bool hasPlyshlog()
     {
@@ -970,6 +1009,7 @@ public:
         if(!isPolymer){
             return Evaluation(muWater);
         }
+        
         const auto& plyvmhCoefficients = plyvmhCoefficients_[polymerMixRegionIdx];
         const Scalar k_mh = plyvmhCoefficients.k_mh;
         const Scalar a_mh = plyvmhCoefficients.a_mh;
@@ -1015,12 +1055,13 @@ public:
         Evaluation specificViscosity = shearThinningSpecificViscosity;
         
         if(elongation){
-            const Scalar critical_Deborah_number = 0.5; // el_lamf = 2.0 / N_De
-            const Scalar el_m2 = 1.5;
-            const Scalar el_x2 = 3.0;
+            const auto& polydegrParameters = polydegrParameters_[polymerMixRegionIdx];
+            const Scalar N_De = polydegrParameters.N_De; // 0.5; // el_lamf = 2.0 / N_De
+            const Scalar el_m = polydegrParameters.el_m; //1.5;
+            const Scalar el_x = polydegrParameters.el_x; // 3.0;
             // Used in som old code: R= 8.314459848
             const Scalar gas_constant = 8.31446261815324; // J/K/mol
-            const Scalar pre_factor = 3.0/(5.0*gas_constant*critical_Deborah_number);
+            const Scalar pre_factor = 3.0/(5.0*gas_constant*N_De);
             // Note (9/5-2019): pre_factor includes effect of oil being present on lambda2.
             Evaluation fac_k_Sw = relWater;
             if(Sw > 0){
@@ -1030,9 +1071,12 @@ public:
             const Evaluation volume_factor(Opm::sqrt(fac_k_Sw)* porosity / (1. - porosity));
             // note: lam2_ICS (Lohne et al. 2017) = (lam2_OPM * 1.07)*(1.0+2.5*0.0015) when using muWater=1.0 and cpol=1.5 kg/m3
             const Evaluation lambda2(pre_factor*volume_factor*muWater*intrinsicViscosity*Mw/temperature);
-            const Evaluation t_exp((el_m2 + pow_n) /  el_x2);
-            const Evaluation elongationFactor(Opm::pow(1.0 + Opm::pow(lambda2 * shearRate, el_x2), t_exp));
+            const Evaluation t_exp((el_m + pow_n) /  el_x);
+            const Evaluation elongationFactor(Opm::pow(1.0 + Opm::pow(lambda2 * shearRate, el_x), t_exp));
             specificViscosity *= elongationFactor;
+            //std::cout << N_De << "\t" << el_m << "\t" << el_x << "\t";
+            //std::cout << rdeg << "\t" << alpha << "\t" << beta << "\n";
+            
         }
         
         Evaluation relativeViscosity(1.0 + specificViscosity);
@@ -1063,6 +1107,7 @@ private:
     static bool hasPlyshlog_;
 
     static std::vector<PlyvmhCoefficients> plyvmhCoefficients_;
+    static std::vector<PolydegrParameters> polydegrParameters_;
     static std::map<int, TabulatedTwoDFunction> plymwinjTables_;
     static std::map<int, TabulatedTwoDFunction> skprwatTables_;
 
@@ -1130,6 +1175,10 @@ BlackOilPolymerModule<TypeTag, enablePolymerV>::hasPlyshlog_;
 template <class TypeTag, bool enablePolymerV>
 std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlyvmhCoefficients>
 BlackOilPolymerModule<TypeTag, enablePolymerV>::plyvmhCoefficients_;
+
+template <class TypeTag, bool enablePolymerV>
+std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PolydegrParameters>
+BlackOilPolymerModule<TypeTag, enablePolymerV>::polydegrParameters_;
 
 template <class TypeTag, bool enablePolymerV>
 std::map<int, typename BlackOilPolymerModule<TypeTag, enablePolymerV>::TabulatedTwoDFunction>
@@ -1270,103 +1319,7 @@ public:
             const Evaluation relWater = 1.0; // TO DO: Get rel.perm. of water also?
             const Evaluation& muWater = fs.viscosity(waterPhaseIdx);
             const Evaluation& Sw = fs.saturation(waterPhaseIdx);
-            /*
-            const Scalar porosity = elemCtx.problem().porosity(elemCtx, dofIdx, timeIdx);
-            const Scalar temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
-            
-            const auto& plyvmhCoefficients = PolymerModule::plyvmhCoefficients(elemCtx, dofIdx, timeIdx);
-            const Scalar k_mh = plyvmhCoefficients.k_mh;
-            const Scalar a_mh = plyvmhCoefficients.a_mh;
-            const Scalar gamma = plyvmhCoefficients.gamma;
-            const Scalar kappa = plyvmhCoefficients.kappa;
 
-            Scalar shear_rate = 0.0;
-            unsigned globalSpaceIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
-            if(!PolymerModule::stashedValues_.empty()){
-                StashedValues& stashedValues = PolymerModule::stashedValues_[globalSpaceIdx];
-                unsigned cellGlobalIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
-                shear_rate = stashedValues.cell_shear_rate;
-                
-                // TO DO: just for testing....
-                epvis_ = stashedValues.debug_value;
-                
-            }
-            
-            const bool isPolymer = (polymerConcentration_.value() > 1.0e-12) ? true : false;
-            const Scalar cPol = isPolymer ? polymerConcentration_.value() : 0.0;
-            
-            // hack: currently this must be manually updated in TWO different places..!!!
-            const bool useCarreauYasudaModel = true;
-            
-            Scalar huggins1 = 0.4;
-            Scalar huggins2 = 0.1;
-            if(useCarreauYasudaModel){
-                huggins1 = 0.01;
-                huggins2 = 0.077;
-            }
-            const Scalar pow_x = 1.0;
-            
-            const Evaluation Mw = polymerMoleWeight_ * 1000.;
-            const Evaluation intrinsicViscosity = k_mh * pow(Mw, a_mh);
-            const Evaluation x = cPol * intrinsicViscosity;
-            const Evaluation specificViscosityAtZeroShearRate = x*(1 + x*(huggins1 + huggins2*x)); // x + k1*x^2 + k2*x^3
-            
-            const Scalar lambda_a = 0.350;
-            const Scalar a_n = 0.063;
-            const Scalar b_n = 0.804;
-            
-            // Calculate Carreau-Yasuda parameters:
-            const Evaluation pow_n = 1.0 - 1.0/(1.0+pow(a_n*x, b_n));
-            
-            // note: lam1_ICS (Lohne et al. 2017) = (lam1_OPM * 1.07)*(1.0+2.5*0.0015) when using muWater=1.0 and cpol=1.5 kg/m3
-            Evaluation lambda1 = lambda_a*muWater*specificViscosityAtZeroShearRate*Mw; // unit of mu = Pa*s ??
-            if(cPol > 0.0){
-                const Scalar denominator = cPol*temperature;
-                lambda1 /= denominator;
-            }
-            
-            const Scalar gamma_hf = 20.0; // 1/sec
-            const Scalar p_alpha = 1.75;
-            
-            Evaluation shearThinningSpecificViscosity = 0.0;
-            if(useCarreauYasudaModel){
-                shearThinningSpecificViscosity = specificViscosityAtZeroShearRate*pow(1+pow(lambda1*shear_rate, pow_x), -pow_n/pow_x);
-            }
-            else{
-                // Meter's model:
-                shearThinningSpecificViscosity = specificViscosityAtZeroShearRate / (1.0 + pow(shear_rate/gamma_hf, p_alpha - 1.0));
-            }
-        
-            // Elongation & degradation parameters:
-            const Scalar critical_Deborah_number = 0.5; // el_lamf = 2.0 / N_De
-            const Scalar el_m2 = 1.5;
-            const Scalar el_x2 = 3.0;
-            
-            const Scalar gas_constant = 8.31446261815324; // J/K/mol
-            const Scalar pre_factor = 3.0/(5.0*gas_constant*critical_Deborah_number);
-            // Note (9/5-2019): pre_factor includes effect of oil being present on lambda2.
-            const Evaluation fac_k_Sw = (Sw > 0) ? (relWater / Sw) : relWater;
-            // TO DO: Add ipv and/or further Sw correction here??
-            const Evaluation volume_factor = Opm::sqrt(fac_k_Sw)* porosity / (1. - porosity);
-            // note: lam2_ICS (Lohne et al. 2017) = (lam2_OPM * 1.07)*(1.0+2.5*0.0015) when using muWater=1.0 and cpol=1.5 kg/m3
-            const Evaluation lambda2 = pre_factor*volume_factor*muWater*intrinsicViscosity*Mw/temperature;
-            const Evaluation t_exp = (el_m2 + pow_n) / el_x2;
-            const Evaluation elongationFactor = Opm::pow(1.0 + Opm::pow(lambda2 * shear_rate, el_x2), t_exp);
-            
-            // TO DO: when to select shear thickening??
-            const Evaluation specificViscosity = shearThinningSpecificViscosity; // *elongationFactor;
-            const Evaluation relativeViscosity = 1.0 + specificViscosity;
-            
-            waterViscosityCorrection_ = 1.0 / relativeViscosity;
-            polymerViscosityCorrection_ =  1.0;
-            
-            // TO DO: Not all quantities printed to summary file match their names (FOR DEBUGGING)
-            emvis_ = lambda2;
-            epvis_ = shearThinningSpecificViscosity*elongationFactor;
-            eta_rel_ = relativeViscosity;
-            shear_rate_ = shear_rate;
-            */
-            
             // DEBUG ONLY:
             Evaluation shear_rate = 0.0;
             unsigned globalSpaceIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
