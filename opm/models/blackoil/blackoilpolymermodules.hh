@@ -53,10 +53,11 @@
 
 #include <caliper/cali.h>
 
+// CRITICAL TO DO: Choose better names etc...
+enum class PolymerInjectivityModel { None = 0, TableBased = 1, SteadyStateBased = 2, IntegratedRate = 3};
+// TO DO: Use "None" instead of "Undefined" here also...??
 enum class AnalyticalLowShearViscosityModel { Undefined = 0, HugginsEquation = 1, CubicEquation = 2, MartinsEquation = 3};
 enum class AnalyticalShearThinningModel { Undefined = 0, CarreauYasuda = 1, Meter = 2};
-// CRITICAL TO DO: Elongation, degradation parameters etc.. (MOVE TO WELL???)
-//enum InjectivityModel {};
 
 namespace Opm {
 /*!
@@ -177,7 +178,8 @@ public:
      */
     static void initFromState(const Opm::EclipseState& eclState)
     {
-        // By default, assume no analytical viscosity models:
+        // By default, assume no analytical viscosity models & no injectivity model for injection wells:
+        injectivityModelType_ = PolymerInjectivityModel::None;
         analyticalShearThinningModelType_ = AnalyticalShearThinningModel::Undefined;
         analyticalLowShearViscosityModelType_ = AnalyticalLowShearViscosityModel::Undefined;
         
@@ -393,8 +395,9 @@ public:
                 throw std::runtime_error("PLYVMH keyword must be specified in POLYMW runs \n");
             }
             else{
+                // CRITICAL TO DO: This is prob. not the best way to set the well model....
+                injectivityModelType_ = PolymerInjectivityModel::TableBased;
                 analyticalLowShearViscosityModelType_ = AnalyticalLowShearViscosityModel::HugginsEquation;
-                includeMechanicalDegradationForInjectors_ = true;
                 
                 assert(plyvmhTable.size() == numMixRegions);
                 for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
@@ -455,8 +458,12 @@ public:
             }
             
             const auto& plydegrTable = eclState.getTableManager().getPlydegrTable();
+            // write warning if no PLYDEGR keyword ??
             if(!plydegrTable.empty()){
-                includeMechanicalDegradationForInjectors_ = true;
+                // TO DO: read type of model from file also..
+                //injectivityModelType_ = PolymerInjectivityModel::SteadyStateBased;
+                injectivityModelType_ = PolymerInjectivityModel::IntegratedRate;
+                
                 // throw std::runtime_error("PLYDEGR keyword must be specified in mechanical degradation model runs \n");
                 assert(plydegrTable.size() == numMixRegions);
                 for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
@@ -1021,9 +1028,9 @@ public:
         return analyticalShearThinningModelType_;
     }
     
-    static bool includeMechanicalDegradation()
+    static PolymerInjectivityModel injectivityModel()
     {
-        return includeMechanicalDegradationForInjectors_;
+        return injectivityModelType_;
     }
 
     static const Scalar shrate(unsigned pvtnumRegionIdx)
@@ -1250,8 +1257,8 @@ private:
     
     static bool hasShrate_;
     static bool hasPlyshlog_;
-    static bool includeMechanicalDegradationForInjectors_;
     
+    static PolymerInjectivityModel injectivityModelType_;
     static AnalyticalLowShearViscosityModel analyticalLowShearViscosityModelType_;
     static AnalyticalShearThinningModel analyticalShearThinningModelType_;
 
@@ -1325,8 +1332,8 @@ bool
 BlackOilPolymerModule<TypeTag, enablePolymerV>::hasPlyshlog_;
 
 template <class TypeTag, bool enablePolymerV>
-bool
-BlackOilPolymerModule<TypeTag, enablePolymerV>::includeMechanicalDegradationForInjectors_;
+PolymerInjectivityModel
+BlackOilPolymerModule<TypeTag, enablePolymerV>::injectivityModelType_;
 
 template <class TypeTag, bool enablePolymerV>
 AnalyticalLowShearViscosityModel
