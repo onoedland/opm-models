@@ -306,3 +306,8 @@ opm_add_test(test_mpiutil
              PROCESSORS 4
              CONDITION ${MPI_FOUND} AND Boost_UNIT_TEST_FRAMEWORK_FOUND
              DRIVER_ARGS --parallel-program=4)
+
+
+set(CALIPER_INCLUDE_DIR "/mnt/c/Users/2904704/cpp_libs/caliper/include")
+include_directories(opm-models PUBLIC ${CALIPER_INCLUDE_DIR})
+
