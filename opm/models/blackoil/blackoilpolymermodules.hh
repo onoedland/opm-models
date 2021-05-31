@@ -107,8 +107,8 @@ public:
     struct PlyvmhCoefficients {
         Scalar k_mh;
         Scalar a_mh;
-        Scalar gamma;
-        Scalar kappa;
+        Scalar k1;
+        Scalar k2;
     };
 
 #if HAVE_ECL_INPUT
@@ -315,12 +315,12 @@ public:
                 for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
                     plyvmhCoefficients_[regionIdx].k_mh = plyvmhTable[regionIdx].k_mh;
                     plyvmhCoefficients_[regionIdx].a_mh = plyvmhTable[regionIdx].a_mh;
-                    plyvmhCoefficients_[regionIdx].gamma = plyvmhTable[regionIdx].gamma;
-                    plyvmhCoefficients_[regionIdx].kappa = plyvmhTable[regionIdx].kappa;
+                    plyvmhCoefficients_[regionIdx].k1 = plyvmhTable[regionIdx].k1;
+                    plyvmhCoefficients_[regionIdx].k2 = plyvmhTable[regionIdx].k2;
                 }
             }
             else {
-                throw std::runtime_error("PLYVMH keyword must be specified in POLYMW rus \n");
+                throw std::runtime_error("PLYVMH keyword must be specified in POLYMW runs \n");
             }
 
             // handling PLYMWINJ keyword
@@ -1097,14 +1097,14 @@ public:
             const auto& plyvmhCoefficients = PolymerModule::plyvmhCoefficients(elemCtx, dofIdx, timeIdx);
             const Scalar k_mh = plyvmhCoefficients.k_mh;
             const Scalar a_mh = plyvmhCoefficients.a_mh;
-            const Scalar gamma = plyvmhCoefficients.gamma;
-            const Scalar kappa = plyvmhCoefficients.kappa;
+            const Scalar k1 = plyvmhCoefficients.k1;
+            const Scalar k2 = plyvmhCoefficients.k2;
 
-            // viscosity model based on Mark-Houwink equation and Huggins equation
-            // 1000 is a emperical constant, most likely related to unit conversion
+            // Viscosity model based on Mark-Houwink equation and Huggins equation
+            // (factor 1000 is used to convert from MDa to kg/mol)
             const Evaluation intrinsicViscosity = k_mh * pow(polymerMoleWeight_ * 1000., a_mh);
             const Evaluation x = polymerConcentration_ * intrinsicViscosity;
-            waterViscosityCorrection_ = 1.0 / (1.0 + gamma * (x + kappa * x * x));
+            waterViscosityCorrection_ = 1.0 / (1.0 + k1 * (x + k2 * x * x));
             polymerViscosityCorrection_ = 1.0;
         }
 
