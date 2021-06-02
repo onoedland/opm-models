@@ -247,7 +247,7 @@ public:
                 setPlymax(mixRegionIdx, plymaxTable.getPolymerConcentrationColumn()[0]);
             }
         }
-        else {
+        else if(!enablePolymerMolarWeight){
             throw std::runtime_error("PLYMAX must be specified in POLYMER runs\n");
         }
 
