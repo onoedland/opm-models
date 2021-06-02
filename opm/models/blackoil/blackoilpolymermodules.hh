@@ -54,6 +54,10 @@
 #include <string>
 
 namespace Opm {
+
+enum class LowShearViscosityModel{None=0, HugginsEquation=1, MartinsEquation=2, CubicEquation=3};
+enum class ShearThinningViscosityModel{None=0, Meter=1, CarreauYasuda=2};
+
 /*!
  * \ingroup BlackOil
  * \brief Contains the high level supplements required to extend the black oil
@@ -101,14 +105,33 @@ class BlackOilPolymerModule
 public:
     enum AdsorptionBehaviour { Desorption = 1, NoDesorption = 2 };
 
-    // a struct containing the constants to calculate polymer viscosity
-    // based on Mark-Houwink equation and Huggins equation, the constants are provided
-    // by the keyword PLYVMH
+    // A struct with constants used to calculate polymer solution viscosity
+    // at low shear rates as a function of polymer concentration and molecular weight.
+    // The constants are provided by the keyword PLYVMH (only used for POLYMW option).
     struct PlyvmhCoefficients {
         Scalar k_mh;
         Scalar a_mh;
         Scalar k1;
         Scalar k2;
+    };
+
+    // A struct with constants used to calculate polymer solution shear thinning
+    // viscosity with Meter's equation (POLYMW option).
+    // The constants are provided by the optional keyword PLYMETER.
+    struct PlymeterCoefficients{
+        Scalar p_alpha;
+        Scalar gamma_hf;
+    };
+
+    // A struct with constants used to calculate polymer solution shear thinning
+    // viscosity with a variant of the Carreau-Yasuda equation (POLYMW option).
+    // The constants are provided by the optional keyword PLYCARR.
+    struct PlycarrCoefficients{
+        Scalar a_n;
+        Scalar b_n;
+        Scalar lam_a;
+        Scalar lam_b;
+        Scalar x;
     };
 
 #if HAVE_ECL_INPUT
@@ -117,6 +140,7 @@ public:
      */
     static void initFromState(const Opm::EclipseState& eclState)
     {
+
         // some sanity checks: if polymers are enabled, the POLYMER keyword must be
         // present, if polymers are disabled the keyword must not be present.
         if (enablePolymer && !eclState.runspec().phases().active(Phase::POLYMER)) {
@@ -191,10 +215,11 @@ public:
         // initialize the objects which deal with the PLYVISC keyword
         const auto& plyviscTables = tableManager.getPlyviscTables();
         if (!plyviscTables.empty()) {
-            // different viscosity model is used for POLYMW
+            // different viscosity models are used for POLYMW
             if (enablePolymerMolarWeight) {
                 Opm::OpmLog::warning("PLYVISC should not be used in POLYMW runs, "
-                                     "it will have no effect. A viscosity model based on PLYVMH is used instead.\n");
+                                     "it will have no effect. A viscosity model based on "
+                                     "PLYVMH, and possibly PLYMETER/PLYCARR, is used instead.\n");
             }
             else {
 
@@ -309,9 +334,20 @@ public:
         }
 
         if (enablePolymerMolarWeight) {
+
+            // handling PLYVMH keyword
             const auto& plyvmhTable = eclState.getTableManager().getPlyvmhTable();
-            if (!plyvmhTable.empty()) {
+            if(!plyvmhTable.empty()){
                 assert(plyvmhTable.size() == numMixRegions);
+
+                const int modelChoice = static_cast<int>(plyvmhTable[0].model);
+                if(modelChoice < 0 || modelChoice > 3)
+                    throw std::runtime_error("Invalid choice of low shear viscosity model (PLYVMH keyword");
+                lowShearViscosityModel_ = static_cast<LowShearViscosityModel>(modelChoice);
+                if(lowShearViscosityModel_ == LowShearViscosityModel::None){
+                    Opm::OpmLog::warning("Polymer has no effect on solution viscosity (PLYVMH keyword)");
+                }
+
                 for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
                     plyvmhCoefficients_[regionIdx].k_mh = plyvmhTable[regionIdx].k_mh;
                     plyvmhCoefficients_[regionIdx].a_mh = plyvmhTable[regionIdx].a_mh;
@@ -319,8 +355,46 @@ public:
                     plyvmhCoefficients_[regionIdx].k2 = plyvmhTable[regionIdx].k2;
                 }
             }
-            else {
+            else{
                 throw std::runtime_error("PLYVMH keyword must be specified in POLYMW runs \n");
+            }
+
+            // Handling of PLYMETER / PLYCARR keywords
+            const auto& plymeterTable = eclState.getTableManager().getPlymeterTable();
+            const auto& plycarrTable = eclState.getTableManager().getPlycarrTable();
+            if(plymeterTable.empty() && plycarrTable.empty()){
+                shearThinningViscosityModel_ = ShearThinningViscosityModel::None;
+                Opm::OpmLog::warning("No shear thinning model is used for POLYMW run.");
+            }
+            else if(!plymeterTable.empty() && !plycarrTable.empty()){
+                throw std::runtime_error("You can specify either PLYMETER or PLYCARR, but not both at the same time.");
+            }
+            else if(!plymeterTable.empty()){
+                shearThinningViscosityModel_ = ShearThinningViscosityModel::Meter;
+            }
+            else if(!plycarrTable.empty()){
+                shearThinningViscosityModel_ = ShearThinningViscosityModel::CarreauYasuda;
+            }
+
+            // Store PLYMETER coefficients?
+            if(shearThinningViscosityModel_ == ShearThinningViscosityModel::Meter){
+                assert(plymeterTable.size() == numMixRegions);
+                for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
+                    plymeterCoefficients_[regionIdx].p_alpha = plymeterTable[regionIdx].p_alpha;
+                    plymeterCoefficients_[regionIdx].gamma_hf = plymeterTable[regionIdx].gamma_hf;
+                }
+            }
+
+            // Store PLYCARR coefficients?
+            if(shearThinningViscosityModel_ == ShearThinningViscosityModel::CarreauYasuda){
+                assert(plycarrTable.size() == numMixRegions);
+                for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
+                    plycarrCoefficients_[regionIdx].a_n = plycarrTable[regionIdx].a_n;
+                    plycarrCoefficients_[regionIdx].b_n = plycarrTable[regionIdx].b_n;
+                    plycarrCoefficients_[regionIdx].lam_a = plycarrTable[regionIdx].lam_a;
+                    plycarrCoefficients_[regionIdx].lam_b = plycarrTable[regionIdx].lam_b;
+                    plycarrCoefficients_[regionIdx].x = plycarrTable[regionIdx].x;
+                }
             }
 
             // handling PLYMWINJ keyword
@@ -360,7 +434,7 @@ public:
                                            TabulatedTwoDFunction(throughput, watervelocity, skinpressure, true, false)};
                 skprpolyTables_[tableNumber] = std::move(tablefunc);
             }
-        }
+        } // end if enablePolymerMolarWeight
     }
 #endif
 
@@ -809,6 +883,22 @@ public:
         return plyvmhCoefficients_[polymerMixRegionIdx];
     }
 
+    static const PlymeterCoefficients& plymeterCoefficients(const ElementContext& elemCtx,
+                                                            const unsigned scvIdx,
+                                                            const unsigned timeIdx)
+    {
+        const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
+        return plymeterCoefficients_[polymerMixRegionIdx];
+    }
+
+    static const PlycarrCoefficients& plycarrCoefficients(const ElementContext& elemCtx,
+                                                          const unsigned scvIdx,
+                                                          const unsigned timeIdx)
+    {
+        const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
+        return plycarrCoefficients_[polymerMixRegionIdx];
+    }
+
     static bool hasPlyshlog()
     {
         return hasPlyshlog_;
@@ -822,6 +912,16 @@ public:
     static const Scalar shrate(unsigned pvtnumRegionIdx)
     {
         return shrate_[pvtnumRegionIdx];
+    }
+
+    static const LowShearViscosityModel lowShearViscosityModel()
+    {
+        return lowShearViscosityModel_;
+    }
+
+    static const ShearThinningViscosityModel shearThinningViscosityModel()
+    {
+        return shearThinningViscosityModel_;
     }
 
     /*!
@@ -922,14 +1022,21 @@ private:
     static std::vector<std::vector<Scalar>> plyshlogShearEffectRefMultiplier_;
     static std::vector<std::vector<Scalar>> plyshlogShearEffectRefLogVelocity_;
     static std::vector<Scalar> shrate_;
-    static bool hasShrate_;
+
     static bool hasPlyshlog_;
+    static bool hasShrate_;
+
+    // Only used for POLYMW option
+    static LowShearViscosityModel lowShearViscosityModel_;
+    static ShearThinningViscosityModel shearThinningViscosityModel_;
 
     static std::vector<PlyvmhCoefficients> plyvmhCoefficients_;
+    static std::vector<PlymeterCoefficients> plymeterCoefficients_;
+    static std::vector<PlycarrCoefficients> plycarrCoefficients_;
     static std::map<int, TabulatedTwoDFunction> plymwinjTables_;
     static std::map<int, TabulatedTwoDFunction> skprwatTables_;
-
     static std::map<int, SkprpolyTable> skprpolyTables_;
+
 };
 
 
@@ -991,8 +1098,24 @@ bool
 BlackOilPolymerModule<TypeTag, enablePolymerV>::hasPlyshlog_;
 
 template <class TypeTag, bool enablePolymerV>
+LowShearViscosityModel
+BlackOilPolymerModule<TypeTag, enablePolymerV>::lowShearViscosityModel_;
+
+template <class TypeTag, bool enablePolymerV>
+ShearThinningViscosityModel
+BlackOilPolymerModule<TypeTag, enablePolymerV>::shearThinningViscosityModel_;
+
+template <class TypeTag, bool enablePolymerV>
 std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlyvmhCoefficients>
 BlackOilPolymerModule<TypeTag, enablePolymerV>::plyvmhCoefficients_;
+
+template <class TypeTag, bool enablePolymerV>
+std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlymeterCoefficients>
+BlackOilPolymerModule<TypeTag, enablePolymerV>::plymeterCoefficients_;
+
+template <class TypeTag, bool enablePolymerV>
+std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlycarrCoefficients>
+BlackOilPolymerModule<TypeTag, enablePolymerV>::plycarrCoefficients_;
 
 template <class TypeTag, bool enablePolymerV>
 std::map<int, typename BlackOilPolymerModule<TypeTag, enablePolymerV>::TabulatedTwoDFunction>
@@ -1094,17 +1217,36 @@ public:
             emvis_ = 1.0 / invMixtureViscosity;
         }
         else { // based on PLYVMH
+
             const auto& plyvmhCoefficients = PolymerModule::plyvmhCoefficients(elemCtx, dofIdx, timeIdx);
             const Scalar k_mh = plyvmhCoefficients.k_mh;
             const Scalar a_mh = plyvmhCoefficients.a_mh;
             const Scalar k1 = plyvmhCoefficients.k1;
             const Scalar k2 = plyvmhCoefficients.k2;
 
-            // Viscosity model based on Mark-Houwink equation and Huggins equation
-            // (factor 1000 is used to convert from MDa to kg/mol)
+            // Viscosity model based on Mark-Houwink equation
+            // (factor 1000 is to convert from MDa to kg/mol)
             const Evaluation intrinsicViscosity = k_mh * pow(polymerMoleWeight_ * 1000., a_mh);
             const Evaluation x = polymerConcentration_ * intrinsicViscosity;
-            waterViscosityCorrection_ = 1.0 / (1.0 + k1 * (x + k2 * x * x));
+
+            Evaluation specificViscosityAtZeroShearRate;
+            switch(PolymerModule::lowShearViscosityModel()){
+                case LowShearViscosityModel::None:
+                    specificViscosityAtZeroShearRate = 0.0;
+                    break;
+                case LowShearViscosityModel::HugginsEquation:
+                    specificViscosityAtZeroShearRate = k1 * x * (1.0 + k2 * x);
+                    break;
+                case LowShearViscosityModel::MartinsEquation:
+                    specificViscosityAtZeroShearRate = x*Opm::exp(k1*x);
+                    break;
+                case LowShearViscosityModel::CubicEquation:
+                    specificViscosityAtZeroShearRate =  x*(1.0 + x*(k1 + k2*x)); // x + k1*x^2 + k2*x^3
+                    break;
+            }
+
+            //waterViscosityCorrection_ = 1.0 / (1.0 + k1 * (x + k2 * x * x));
+            waterViscosityCorrection_ = 1.0 / (1.0 + specificViscosityAtZeroShearRate);
             polymerViscosityCorrection_ = 1.0;
         }
 
