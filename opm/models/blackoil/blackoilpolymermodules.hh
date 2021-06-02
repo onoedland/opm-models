@@ -134,6 +134,16 @@ public:
         Scalar x;
     };
 
+    // An experimental struct used when combining POLYMW with a non-Newtonian polymer solution.
+    // We keep track of the latest water phase velocities + a cell-based shear-rate value.
+    // The shear rate is calculated from the velocities and the rock-fluid properties.
+    struct StashedValues{
+        Dune::FieldVector<Scalar, 6> face_velocities;
+        Scalar average_cell_velocity;
+        Evaluation cell_shear_rate;
+    };
+    static std::map<int, StashedValues> stashedValues_;
+
 #if HAVE_ECL_INPUT
     /*!
      * \brief Initialize all internal data structures needed by the polymer module
@@ -270,8 +280,8 @@ public:
         hasPlyshlog_ = eclState.getTableManager().hasTables("PLYSHLOG");
         hasShrate_ = eclState.getTableManager().useShrate();
 
-        if ((hasPlyshlog_ || hasShrate_) && enablePolymerMolarWeight) {
-            Opm::OpmLog::warning("PLYSHLOG and SHRATE should not be used in POLYMW runs, they will have no effect.\n");
+        if (hasPlyshlog_ && enablePolymerMolarWeight) {
+            Opm::OpmLog::warning("PLYSHLOG should not be used in POLYMW runs, it will have no effect.\n");
         }
 
         if (hasPlyshlog_ && !enablePolymerMolarWeight) {
@@ -314,8 +324,9 @@ public:
             }
         }
 
-        if (hasShrate_ && !enablePolymerMolarWeight) {
-            if(!hasPlyshlog_) {
+        if (hasShrate_) {
+            // Note: The POLYMW option might also use the SHRATE keyword! (in case of non-Newtonian flow)
+            if(!enablePolymerMolarWeight && !hasPlyshlog_) {
                 throw std::runtime_error("PLYSHLOG must be specified if SHRATE is used in POLYMER runs\n");
             }
             const auto& shrateTable = eclState.getTableManager().getShrateTable();
@@ -395,6 +406,11 @@ public:
                     plycarrCoefficients_[regionIdx].lam_b = plycarrTable[regionIdx].lam_b;
                     plycarrCoefficients_[regionIdx].x = plycarrTable[regionIdx].x;
                 }
+            }
+
+            const bool isShearThinning = shearThinningViscosityModel_ != ShearThinningViscosityModel::None;
+            if(isShearThinning && !hasShrate_){
+                throw std::runtime_error("SHRATE must be activated when using PLYMETER / PLYCARR!\n");
             }
 
             // handling PLYMWINJ keyword
@@ -505,6 +521,9 @@ public:
 
         if (enablePolymerMolarWeight) {
             plyvmhCoefficients_.resize(numRegions);
+            // Note: We resize both of these, even though at most one of them is used...
+            plymeterCoefficients_.resize(numRegions);
+            plycarrCoefficients_.resize(numRegions);
         }
     }
 
@@ -914,12 +933,12 @@ public:
         return shrate_[pvtnumRegionIdx];
     }
 
-    static const LowShearViscosityModel lowShearViscosityModel()
+    static LowShearViscosityModel lowShearViscosityModel()
     {
         return lowShearViscosityModel_;
     }
 
-    static const ShearThinningViscosityModel shearThinningViscosityModel()
+    static ShearThinningViscosityModel shearThinningViscosityModel()
     {
         return shearThinningViscosityModel_;
     }
@@ -1129,6 +1148,10 @@ template <class TypeTag, bool enablePolymerV>
 std::map<int, typename BlackOilPolymerModule<TypeTag, enablePolymerV>::SkprpolyTable>
 BlackOilPolymerModule<TypeTag, enablePolymerV>::skprpolyTables_;
 
+template <class TypeTag, bool enablePolymerV>
+std::map<int, typename BlackOilPolymerModule<TypeTag, enablePolymerV>::StashedValues>
+BlackOilPolymerModule<TypeTag, enablePolymerV>::stashedValues_;
+
 /*!
  * \ingroup BlackOil
  * \class Opm::BlackOilPolymerIntensiveQuantities
@@ -1150,6 +1173,7 @@ class BlackOilPolymerIntensiveQuantities
     using ElementContext = GetPropType<TypeTag, Properties::ElementContext>;
 
     using PolymerModule = BlackOilPolymerModule<TypeTag>;
+    using StashedValues = typename PolymerModule::StashedValues;
 
     enum { numPhases = getPropValue<TypeTag, Properties::NumPhases>() };
     static constexpr int polymerConcentrationIdx = Indices::polymerConcentrationIdx;
@@ -1191,9 +1215,10 @@ public:
         const Evaluation resistanceFactor = 1.0 + (residualResistanceFactor - 1.0) * polymerAdsorption_ / maxAdsorbtion;
 
         // compute effective viscosities
+        const auto& fs = asImp_().fluidState_;
+        const Evaluation& muWater = fs.viscosity(waterPhaseIdx);
+
         if (!enablePolymerMolarWeight) {
-            const auto& fs = asImp_().fluidState_;
-            const Evaluation& muWater = fs.viscosity(waterPhaseIdx);
             const auto& viscosityMultiplier = PolymerModule::plyviscViscosityMultiplierTable(elemCtx, dofIdx, timeIdx);
             const Evaluation viscosityMixture = viscosityMultiplier.eval(polymerConcentration_, /*extrapolate=*/true) * muWater;
 
@@ -1224,29 +1249,80 @@ public:
             const Scalar k1 = plyvmhCoefficients.k1;
             const Scalar k2 = plyvmhCoefficients.k2;
 
-            // Viscosity model based on Mark-Houwink equation
+            // Low-shear viscosity model based on Mark-Houwink equation
             // (factor 1000 is to convert from MDa to kg/mol)
             const Evaluation intrinsicViscosity = k_mh * pow(polymerMoleWeight_ * 1000., a_mh);
             const Evaluation x = polymerConcentration_ * intrinsicViscosity;
 
-            Evaluation specificViscosityAtZeroShearRate;
+            // Specific viscosity at zero shear rate:
+            Evaluation specificViscosity = 0.0;
             switch(PolymerModule::lowShearViscosityModel()){
-                case LowShearViscosityModel::None:
-                    specificViscosityAtZeroShearRate = 0.0;
+                case LowShearViscosityModel::None: {
                     break;
-                case LowShearViscosityModel::HugginsEquation:
-                    specificViscosityAtZeroShearRate = k1 * x * (1.0 + k2 * x);
+                }
+                case LowShearViscosityModel::HugginsEquation: {
+                    specificViscosity = k1 * x * (1.0 + k2 * x);
                     break;
-                case LowShearViscosityModel::MartinsEquation:
-                    specificViscosityAtZeroShearRate = x*Opm::exp(k1*x);
+                }
+                case LowShearViscosityModel::MartinsEquation: {
+                    specificViscosity = x*Opm::exp(k1*x);
                     break;
-                case LowShearViscosityModel::CubicEquation:
-                    specificViscosityAtZeroShearRate =  x*(1.0 + x*(k1 + k2*x)); // x + k1*x^2 + k2*x^3
+                }
+                case LowShearViscosityModel::CubicEquation: {
+                    specificViscosity = x*(1.0 + x*(k1 + k2*x)); // x + k1*x^2 + k2*x^3
                     break;
+                }
             }
 
-            //waterViscosityCorrection_ = 1.0 / (1.0 + k1 * (x + k2 * x * x));
-            waterViscosityCorrection_ = 1.0 / (1.0 + specificViscosityAtZeroShearRate);
+            // Correction due to shear thinning?
+            Evaluation shearRate = 0.0;
+            const auto& shearThinningModel = PolymerModule::shearThinningViscosityModel();
+            const bool isShearThinning = shearThinningModel != ShearThinningViscosityModel::None;
+
+            if(isShearThinning && !PolymerModule::stashedValues_.empty()){
+                unsigned cellGlobalIdx = elemCtx.globalSpaceIndex(dofIdx, timeIdx);
+                StashedValues& stashedValues = PolymerModule::stashedValues_[cellGlobalIdx];
+                shearRate = stashedValues.cell_shear_rate;
+            }
+
+            switch (shearThinningModel) {
+                case ShearThinningViscosityModel::None: {
+                    break;
+                }
+                case ShearThinningViscosityModel::Meter: {
+                    if(shearRate < 1.0e-12){
+                        break;
+                    }
+
+                    const auto &plymeterCoefficients = PolymerModule::plymeterCoefficients(elemCtx, dofIdx, timeIdx);
+                    const Scalar p_alpha = plymeterCoefficients.p_alpha;
+                    const Scalar gamma_hf = plymeterCoefficients.gamma_hf;
+                    specificViscosity = specificViscosity / (1.0 + Opm::pow(shearRate / gamma_hf, p_alpha - 1.0));
+                    break;
+                }
+                case ShearThinningViscosityModel::CarreauYasuda: {
+                    if(shearRate < 1.0e-12 || polymerConcentration_ < 1.0e-12) {
+                        break;
+                    }
+
+                    const auto &plycarrCoefficients = PolymerModule::plycarrCoefficients(elemCtx, dofIdx, timeIdx);
+                    const Scalar pow_x = plycarrCoefficients.x;
+                    const Scalar lam_a = plycarrCoefficients.lam_a;
+                    const Scalar lam_b = plycarrCoefficients.lam_b;
+                    const Scalar a_n = plycarrCoefficients.a_n;
+                    const Scalar b_n = plycarrCoefficients.b_n;
+                    const Scalar temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
+                    const Evaluation pow_n = 1.0 - Opm::pow(1.0 + Opm::pow(a_n * x, b_n), -1.0);
+                    // Factor 1000.0 is to convert from MDa to kg/mol:
+                    const Evaluation lam1 = lam_a * Opm::pow(
+                            (muWater * specificViscosity * polymerMoleWeight_ * 1.0e3) /
+                            (polymerConcentration_ * temperature), lam_b);
+                    specificViscosity *= Opm::pow(1 + Opm::pow(lam1 * shearRate, pow_x), -pow_n / pow_x);
+                    break;
+                }
+            }
+
+            waterViscosityCorrection_ = 1.0 / (1.0 + specificViscosity);
             polymerViscosityCorrection_ = 1.0;
         }
 
@@ -1408,6 +1484,9 @@ class BlackOilPolymerExtensiveQuantities
     using DimVector = Dune::FieldVector<Scalar, dimWorld>;
     using DimEvalVector = Dune::FieldVector<Evaluation, dimWorld>;
 
+    using StashedValues = typename PolymerModule::StashedValues;
+    static constexpr bool enablePolymerMolarWeight = getPropValue<TypeTag, Properties::EnablePolymerMW>();
+
 public:
     /*!
      * \brief Method which calculates the shear factor based on flow velocity
@@ -1493,6 +1572,91 @@ public:
 
     }
 
+    /*!
+     * \brief Method which calculates in-situ shear rate based on flow velocity
+     *
+     * Note that this implementation is only used by the POLYMW option.
+     */
+    template <class Dummy = bool> // we need to make this method a template to avoid
+    // compiler errors if it is not instantiated!
+    void calculateCellBasedInSituShearRate(const ElementContext& elemCtx,
+                                           unsigned scvfIdx,
+                                           unsigned timeIdx)
+    {
+        const bool isShearThinning = PolymerModule::shearThinningViscosityModel() != ShearThinningViscosityModel::None;
+        if (!enablePolymerMolarWeight || !isShearThinning)
+            return;
+
+        const ExtensiveQuantities & extQuants = asImp_();
+        unsigned upIdx = extQuants.upstreamIndex(waterPhaseIdx);
+        unsigned interiorDofIdx = extQuants.interiorIndex();
+        unsigned exteriorDofIdx = extQuants.exteriorIndex();
+        const auto& up = elemCtx.intensiveQuantities(upIdx, timeIdx);
+        const auto& intQuantsIn = elemCtx.intensiveQuantities(interiorDofIdx, timeIdx);
+        const auto& intQuantsEx = elemCtx.intensiveQuantities(exteriorDofIdx, timeIdx);
+
+        // compute water velocity from flux
+        Evaluation poroAvg = intQuantsIn.porosity()*0.5 + intQuantsEx.porosity()*0.5;
+        unsigned pvtnumRegionIdx = elemCtx.problem().pvtRegionIndex(elemCtx, scvfIdx, timeIdx);
+        const Evaluation& Sw = up.fluidState().saturation(waterPhaseIdx);
+        unsigned cellIdx = elemCtx.globalSpaceIndex(scvfIdx, timeIdx);
+        const auto& materialLawManager = elemCtx.problem().materialLawManager();
+        const auto& scaledDrainageInfo =
+                materialLawManager->oilWaterScaledEpsInfoDrainage(cellIdx);
+
+        // guard against zero porosity and no mobile water
+        const Scalar& Swcr = scaledDrainageInfo.Swcr;
+        Evaluation denom = Opm::max(poroAvg * (Sw - Swcr), 1e-12);
+        Evaluation waterVolumeVelocity = extQuants.volumeFlux(waterPhaseIdx) / denom;
+
+        unsigned numInteriorFaces = elemCtx.numInteriorFaces(timeIdx);
+        unsigned cellGlobalIdx = elemCtx.globalSpaceIndex(interiorDofIdx, timeIdx);
+
+        StashedValues& stashedValues = PolymerModule::stashedValues_[cellGlobalIdx];
+        if(scvfIdx == 0) // first face
+        {
+            stashedValues.face_velocities = 0.0;
+            stashedValues.average_cell_velocity = 0.0;
+            stashedValues.cell_shear_rate = 0.0;
+        }
+        stashedValues.face_velocities[scvfIdx] = Opm::abs(waterVolumeVelocity).value();
+
+        // CRITICAL TODO: Account for rel.perm in shear rate calculation
+        const Evaluation relWater = 1.0; //up.relativePermeability(waterPhaseIdx);
+        const Scalar alphaFactor = PolymerModule::shrate(pvtnumRegionIdx);
+
+        if (scvfIdx == numInteriorFaces - 1){
+            // We have reached the last interior face, and we are therefore ready
+            // to compute an average velocity for the grid cell
+
+            // TO DO: Generalize properly to 2D & 3D:
+            //          - How to weigh different velocities in the average?
+            //          - How to adjust for directional permeabilities?
+            Scalar sumVelocitySquared = 0.0;
+            for(unsigned faceIdx=0; faceIdx < numInteriorFaces; ++faceIdx){
+
+                Scalar velocity = stashedValues.face_velocities[faceIdx];
+                sumVelocitySquared += velocity*velocity;
+            }
+            const Scalar avgCellVelocity = Opm::sqrt(sumVelocitySquared/numInteriorFaces);
+
+            // Get permeability for shear rate calculation
+            // Note: This is specific to finite volume discretizations
+            const auto& K = elemCtx.problem().intrinsicPermeability(cellGlobalIdx); // 3x3 matrix
+            const auto& Kx = K[0][0];
+            const auto& Ky = K[1][1];
+            const auto& Kz = K[2][2];
+            const auto& absPermCell = Kx; // TO DO: generalize... (see comment above)
+
+            Evaluation cellShearRate = 0.0;
+            if(absPermCell > 0 && relWater > 0){
+                cellShearRate = avgCellVelocity*alphaFactor*Opm::sqrt(2.0*poroAvg*Sw / (relWater*absPermCell));
+            }
+            stashedValues.average_cell_velocity = avgCellVelocity;
+            stashedValues.cell_shear_rate = cellShearRate;
+        }
+    }
+
     const Evaluation& polymerShearFactor() const
     { return polymerShearFactor_; }
 
@@ -1524,6 +1688,11 @@ public:
     void updateShearMultipliersPerm(const ElementContext& elemCtx OPM_UNUSED,
                                     unsigned scvfIdx OPM_UNUSED,
                                     unsigned timeIdx OPM_UNUSED)
+    { }
+
+    void calculateCellBasedInSituShearRate(const ElementContext& elemCtx OPM_UNUSED,
+                                           unsigned scvfIdx OPM_UNUSED,
+                                           unsigned timeIdx OPM_UNUSED)
     { }
 
     const Evaluation& polymerShearFactor() const
