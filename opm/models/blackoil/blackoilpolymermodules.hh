@@ -1284,6 +1284,7 @@ public:
                 StashedValues& stashedValues = PolymerModule::stashedValues_[cellGlobalIdx];
                 shearRate = stashedValues.cell_shear_rate;
             }
+            cellShearRatePolymer_ = shearRate; // for output
 
             switch (shearThinningModel) {
                 case ShearThinningViscosityModel::None: {
@@ -1322,7 +1323,12 @@ public:
                 }
             }
 
-            waterViscosityCorrection_ = 1.0 / (1.0 + specificViscosity);
+            const Evaluation polymerRelativeViscosity = 1.0 + specificViscosity;
+            polymerApparentViscosity_ = muWater*polymerRelativeViscosity;
+
+            // We use the same correction factors as the ECLIPSE model for
+            // setting up and solving the flow equations:
+            waterViscosityCorrection_ = 1.0 / polymerRelativeViscosity;
             polymerViscosityCorrection_ = 1.0;
         }
 
@@ -1389,6 +1395,24 @@ public:
     return ewv_pol_;
     }
 
+    const Evaluation& polymerApparentViscosity() const
+    {
+    if (!enablePolymerMolarWeight){
+        throw std::logic_error("polymerApparentViscosity() is only available for the POLYMW polymer option.");
+    }
+
+    return polymerApparentViscosity_;
+    }
+
+    const Evaluation& polymerInSituShearRate() const
+    {
+    if (!enablePolymerMolarWeight){
+        throw std::logic_error("polymerInSituShearRate() is only available for the POLYMW polymer option.");
+    }
+
+    return cellShearRatePolymer_;
+    }
+
 
 protected:
     Implementation& asImp_()
@@ -1396,16 +1420,19 @@ protected:
 
     Evaluation polymerConcentration_;
     Evaluation polymerMoleWeight_;
+
     Scalar polymerDeadPoreVolume_;
     Scalar polymerRockDensity_;
     Evaluation polymerAdsorption_;
+
     Evaluation polymerViscosityCorrection_;
     Evaluation waterViscosityCorrection_;
-
     Evaluation emvis_;
     Evaluation epvis_;
     Evaluation ewv_pol_;
 
+    Evaluation polymerApparentViscosity_;
+    Evaluation cellShearRatePolymer_;
 
 };
 
@@ -1451,6 +1478,12 @@ public:
 
     const Evaluation& ewv_pol() const
     { throw std::runtime_error("ewv_pol() called but polymers are disabled"); }
+
+    const Evaluation& polymerApparentViscosity() const
+    { throw std::runtime_error(" polymerApparentViscosity() called but polymers are disabled"); }
+
+    const Evaluation& polymerInSituShearRate() const
+    { throw std::runtime_error("polymerInSituShearRate() called but polymers are disabled"); }
 
 };
 
