@@ -55,6 +55,7 @@
 
 namespace Opm {
 
+enum class InjectivityModel{None=0, TableBased=1};
 enum class LowShearViscosityModel{None=0, HugginsEquation=1, MartinsEquation=2, CubicEquation=3};
 enum class ShearThinningViscosityModel{None=0, Meter=1, CarreauYasuda=2};
 
@@ -450,6 +451,14 @@ public:
                                            TabulatedTwoDFunction(throughput, watervelocity, skinpressure, true, false)};
                 skprpolyTables_[tableNumber] = std::move(tablefunc);
             }
+
+            if(!plymwinjTables.empty() && !skprwatTables.empty() && !skprpolyTables.empty()){
+                injectivityModel_ = InjectivityModel::TableBased;
+            }
+            else{
+                injectivityModel_ = InjectivityModel::None;
+            }
+
         } // end if enablePolymerMolarWeight
     }
 #endif
@@ -943,6 +952,11 @@ public:
         return shearThinningViscosityModel_;
     }
 
+    static InjectivityModel injectivityModel()
+    {
+        return injectivityModel_;
+    }
+
     /*!
      * \brief Computes the shear factor
      *
@@ -1048,6 +1062,7 @@ private:
     // Only used for POLYMW option
     static LowShearViscosityModel lowShearViscosityModel_;
     static ShearThinningViscosityModel shearThinningViscosityModel_;
+    static InjectivityModel injectivityModel_;
 
     static std::vector<PlyvmhCoefficients> plyvmhCoefficients_;
     static std::vector<PlymeterCoefficients> plymeterCoefficients_;
@@ -1123,6 +1138,10 @@ BlackOilPolymerModule<TypeTag, enablePolymerV>::lowShearViscosityModel_;
 template <class TypeTag, bool enablePolymerV>
 ShearThinningViscosityModel
 BlackOilPolymerModule<TypeTag, enablePolymerV>::shearThinningViscosityModel_;
+
+template <class TypeTag, bool enablePolymerV>
+InjectivityModel
+BlackOilPolymerModule<TypeTag, enablePolymerV>::injectivityModel_;
 
 template <class TypeTag, bool enablePolymerV>
 std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlyvmhCoefficients>
