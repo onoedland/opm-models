@@ -55,7 +55,7 @@
 
 namespace Opm {
 
-enum class InjectivityModel{None=0, TableBased=1};
+enum class InjectivityModel{None=0, TableBased=1, ODEBasedSteadyState = 2, ODEBasedTimeDependent = 3};
 enum class LowShearViscosityModel{None=0, HugginsEquation=1, MartinsEquation=2, CubicEquation=3};
 enum class ShearThinningViscosityModel{None=0, Meter=1, CarreauYasuda=2};
 
@@ -363,7 +363,7 @@ public:
 
                 const int modelChoice = static_cast<int>(plyvmhTable[0].model);
                 if(modelChoice < 0 || modelChoice > 3)
-                    throw std::runtime_error("Invalid choice of low shear viscosity model (PLYVMH keyword");
+                    throw std::runtime_error("Invalid choice of low shear viscosity model (PLYVMH keyword)");
                 lowShearViscosityModel_ = static_cast<LowShearViscosityModel>(modelChoice);
                 if(lowShearViscosityModel_ == LowShearViscosityModel::None){
                     Opm::OpmLog::warning("Polymer has no effect on solution viscosity (PLYVMH keyword)");
@@ -461,7 +461,26 @@ public:
                 skprpolyTables_[tableNumber] = std::move(tablefunc);
             }
 
-            if(!plymwinjTables.empty() && !skprwatTables.empty() && !skprpolyTables.empty()){
+            // handling of PLYDEGR keyword (alternate model to the one using PLYMWINJ, SKPRWAT, SKPRPOLY)
+            const auto& plydegrTable = eclState.getTableManager().getPlydegrTable();
+            if(!plydegrTable.empty()){
+                assert(plydegrTable.size() == numMixRegions);
+                const int degrModelChoice = static_cast<int>(plydegrTable[0].model);
+                if(degrModelChoice != 1 && degrModelChoice != 2)
+                    throw std::runtime_error("Invalid choice of polymer degradation model (PLYDEGR keyword)");
+                injectivityModel_ = static_cast<InjectivityModel>(degrModelChoice+1);
+                // TO DO: Write message to log file if PLYMWINJ / SKPRWAT / SKPRPOLY is also included in deck??
+
+                for (size_t regionIdx = 0; regionIdx < numMixRegions; ++regionIdx) {
+                    plydegrCoefficients_[regionIdx].N_De = plydegrTable[regionIdx].N_De;
+                    plydegrCoefficients_[regionIdx].el_m = plydegrTable[regionIdx].el_m;
+                    plydegrCoefficients_[regionIdx].el_x = plydegrTable[regionIdx].el_x;
+                    plydegrCoefficients_[regionIdx].rdeg = plydegrTable[regionIdx].rdeg;
+                    plydegrCoefficients_[regionIdx].alpha = plydegrTable[regionIdx].alpha;
+                    plydegrCoefficients_[regionIdx].beta = plydegrTable[regionIdx].beta;
+                }
+            }
+            else if(!plymwinjTables.empty() && !skprwatTables.empty() && !skprpolyTables.empty()){
                 injectivityModel_ = InjectivityModel::TableBased;
             }
             else{
@@ -1055,6 +1074,17 @@ public:
     }
 
     template <class Evaluation>
+    static Evaluation computeWellShearRate(const Evaluation& darcyVelocityWell,
+                                           const Scalar absolutePermeability,
+                                           const Scalar& porosity,
+                                           const Evaluation& Sw,
+                                           const Evaluation& relWater,
+                                           const Scalar alphaFactor)
+    {
+        return  (4.0*alphaFactor*darcyVelocityWell)/(Opm::sqrt(8.0*relWater*absolutePermeability*porosity*Sw));
+    }
+
+    template <class Evaluation>
     static Evaluation calcRelativeViscosityPolymerMw(const Evaluation& polymerConcentration,
                                                      const Evaluation& Mw,  // kg/mol
                                                      unsigned polymerMixRegionIdx,
@@ -1063,7 +1093,8 @@ public:
                                                      const Scalar& porosity,
                                                      const Scalar& temperature,
                                                      const Evaluation& Sw,
-                                                     const Evaluation& relWater)
+                                                     const Evaluation& relWater,
+                                                     bool elongation=false)
     {
         static constexpr double zeroThreshold = 1.0e-12;
         using ToolboxLocal = Opm::MathToolbox<Evaluation>;
@@ -1113,7 +1144,7 @@ public:
                 const Scalar& p_alpha = plymeterCoefficients.p_alpha;
                 const Scalar& gamma_hf = plymeterCoefficients.gamma_hf;
                 specificViscosity = specificViscosity / (1.0 + Opm::pow(shearRate / gamma_hf, p_alpha - 1.0));
-                pow_n = ToolboxLocal::createConstant(p_alpha - 2.0); // only used if elongation == True
+                pow_n = ToolboxLocal::createConstant(Mw, p_alpha - 2.0); // only used if elongation == True
                 break;
             }
             case ShearThinningViscosityModel::CarreauYasuda: {
@@ -1128,6 +1159,27 @@ public:
                 specificViscosity *= Opm::pow(1 + Opm::pow(lam1 * shearRate, pow_x), -pow_n / pow_x);
                 break;
             }
+        }
+
+        if(elongation){
+
+            const auto &plydegrCoefficients = plydegrCoefficients_[polymerMixRegionIdx];
+            const Scalar N_De = plydegrCoefficients.N_De;
+            const Scalar el_m = plydegrCoefficients.el_m;
+            const Scalar el_x = plydegrCoefficients.el_x;
+            const Scalar gas_constant = 8.31446261815324; // J/K/mol
+            const Scalar pre_factor = 3.0/(5.0*gas_constant*N_De);
+
+            Evaluation fac_k_Sw = relWater;
+            if(Sw > 0){
+                fac_k_Sw /= Sw;
+            }
+
+            const Evaluation volume_factor = Opm::sqrt(fac_k_Sw)* porosity / (1.0 - porosity);
+            const Evaluation lambda2 = pre_factor*volume_factor*muWater*intrinsicViscosity*Mw / temperature;
+            const Evaluation t_exp = (el_m + pow_n) /  el_x;
+            const Evaluation elongationFactor = Opm::pow(1.0 + Opm::pow(lambda2 * shearRate, el_x), t_exp);
+            specificViscosity *= elongationFactor;
         }
 
         return  1.0 + specificViscosity;
@@ -1377,7 +1429,8 @@ public:
             const Evaluation& Sw = fs.saturation(waterPhaseIdx);
             const Scalar& porosity = elemCtx.problem().porosity(elemCtx, dofIdx, timeIdx);
             const Scalar& temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
-            const Evaluation relWater = 1.0; // TO DO: Get rel.perm. of water also...
+            const auto& intQuants = elemCtx.intensiveQuantities(dofIdx, timeIdx);
+            const Evaluation& relWater = intQuants.relativePermeability(waterPhaseIdx);
 
             const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, dofIdx, timeIdx);
             const Evaluation relativeViscosity = PolymerModule::calcRelativeViscosityPolymerMw(polymerConcentration_,
@@ -1706,8 +1759,8 @@ public:
                 materialLawManager->oilWaterScaledEpsInfoDrainage(cellIdx);
 
         // guard against zero porosity and no mobile water
-        const Scalar& Swcr = scaledDrainageInfo.Swcr;
-        Evaluation denom = Opm::max(poroAvg * (Sw - Swcr), 1e-12);
+        // Note: We divide by the total water saturation, not the mobile one as is done in updateShearMultipliers()
+        Evaluation denom = Opm::max(poroAvg * Sw, 1e-12);
         Evaluation waterVolumeVelocity = extQuants.volumeFlux(waterPhaseIdx) / denom;
 
         unsigned numInteriorFaces = elemCtx.numInteriorFaces(timeIdx);
@@ -1722,8 +1775,7 @@ public:
         }
         stashedValues.face_velocities[scvfIdx] = Opm::abs(waterVolumeVelocity).value();
 
-        // CRITICAL TODO: Account for rel.perm in shear rate calculation
-        const Evaluation relWater = 1.0; //up.relativePermeability(waterPhaseIdx);
+        const Evaluation relWater = intQuantsIn.relativePermeability(waterPhaseIdx);
         const Scalar alphaFactor = PolymerModule::shrate(pvtnumRegionIdx);
 
         if (scvfIdx == numInteriorFaces - 1){
