@@ -1003,7 +1003,6 @@ public:
 
         // Find sheared velocity (v) that satisfies
         // F = log(v) + log (Z) - log(v0) = 0;
-
         // Set up the function
         // u = log(v)
         auto F = [&logShearEffectMultiplier, &v0AbsLog](const Evaluation& u) {
@@ -1035,6 +1034,85 @@ public:
         // return the shear factor
         return Opm::exp(logShearEffectMultiplier.eval(u, /*extrapolate=*/true));
 
+    }
+
+    template <class Evaluation>
+    static Evaluation calcRelativeViscosityPolymerMw(const Evaluation& polymerConcentration,
+                                                     const Evaluation& Mw,  // kg/mol
+                                                     unsigned polymerMixRegionIdx,
+                                                     const Evaluation& shearRate,
+                                                     const Evaluation& muWater,
+                                                     const Scalar& porosity,
+                                                     const Scalar& temperature,
+                                                     const Evaluation& Sw,
+                                                     const Evaluation& relWater)
+    {
+        static constexpr double zeroThreshold = 1.0e-12;
+        using ToolboxLocal = Opm::MathToolbox<Evaluation>;
+
+        const auto& plyvmhCoefficients = plyvmhCoefficients_[polymerMixRegionIdx];
+        const Scalar& k_mh = plyvmhCoefficients.k_mh;
+        const Scalar& a_mh = plyvmhCoefficients.a_mh;
+        const Scalar& k1 = plyvmhCoefficients.k1;
+        const Scalar& k2 = plyvmhCoefficients.k2;
+
+        // Low-shear viscosity model based on Mark-Houwink equation
+        const Evaluation intrinsicViscosity = k_mh * Opm::pow(Mw, a_mh);
+        const Evaluation x = polymerConcentration * intrinsicViscosity;
+
+        // Specific viscosity at zero shear rate
+        Evaluation specificViscosity = ToolboxLocal::createConstant(Mw, 0.0);
+        switch(lowShearViscosityModel_){
+            case LowShearViscosityModel::None: {
+                break;
+            }
+            case LowShearViscosityModel::HugginsEquation: {
+                specificViscosity = k1 * x * (1.0 + k2 * x);
+                break;
+            }
+            case LowShearViscosityModel::MartinsEquation: {
+                specificViscosity = x*Opm::exp(k1*x);
+                break;
+            }
+            case LowShearViscosityModel::CubicEquation: {
+                specificViscosity = x*(1.0 + x*(k1 + k2*x)); // x + k1*x^2 + k2*x^3
+                break;
+            }
+        }
+
+        if(shearRate < zeroThreshold || polymerConcentration < zeroThreshold){
+            return 1.0 + specificViscosity;
+        }
+
+        Evaluation pow_n = ToolboxLocal::createConstant(Mw, 1.0);
+
+        switch (shearThinningViscosityModel_) {
+            case ShearThinningViscosityModel::None: {
+                break;
+            }
+            case ShearThinningViscosityModel::Meter: {
+                const auto &plymeterCoefficients = plymeterCoefficients_[polymerMixRegionIdx];
+                const Scalar& p_alpha = plymeterCoefficients.p_alpha;
+                const Scalar& gamma_hf = plymeterCoefficients.gamma_hf;
+                specificViscosity = specificViscosity / (1.0 + Opm::pow(shearRate / gamma_hf, p_alpha - 1.0));
+                pow_n = ToolboxLocal::createConstant(p_alpha - 2.0); // only used if elongation == True
+                break;
+            }
+            case ShearThinningViscosityModel::CarreauYasuda: {
+                const auto &plycarrCoefficients = plycarrCoefficients_[polymerMixRegionIdx];
+                const Scalar& pow_x = plycarrCoefficients.x;
+                const Scalar& lam_a = plycarrCoefficients.lam_a;
+                const Scalar& lam_b = plycarrCoefficients.lam_b;
+                const Scalar& a_n = plycarrCoefficients.a_n;
+                const Scalar& b_n = plycarrCoefficients.b_n;
+                pow_n = 1.0 - Opm::pow(1.0 + Opm::pow(a_n * x, b_n), -1.0);
+                const Evaluation lam1 = lam_a * Opm::pow((muWater * specificViscosity * Mw) /(polymerConcentration * temperature), lam_b);
+                specificViscosity *= Opm::pow(1 + Opm::pow(lam1 * shearRate, pow_x), -pow_n / pow_x);
+                break;
+            }
+        }
+
+        return  1.0 + specificViscosity;
     }
 
     const Scalar molarMass() const
@@ -1260,40 +1338,9 @@ public:
             ewv_pol_ = viscosityWaterEffective;
             emvis_ = 1.0 / invMixtureViscosity;
         }
-        else { // based on PLYVMH
+        else { // viscosity as a function of polymer molecular weight, and potentially shear rate (non-Newtonian flow)
 
-            const auto& plyvmhCoefficients = PolymerModule::plyvmhCoefficients(elemCtx, dofIdx, timeIdx);
-            const Scalar k_mh = plyvmhCoefficients.k_mh;
-            const Scalar a_mh = plyvmhCoefficients.a_mh;
-            const Scalar k1 = plyvmhCoefficients.k1;
-            const Scalar k2 = plyvmhCoefficients.k2;
-
-            // Low-shear viscosity model based on Mark-Houwink equation
-            // (factor 1000 is to convert from MDa to kg/mol)
-            const Evaluation intrinsicViscosity = k_mh * pow(polymerMoleWeight_ * 1000., a_mh);
-            const Evaluation x = polymerConcentration_ * intrinsicViscosity;
-
-            // Specific viscosity at zero shear rate:
-            Evaluation specificViscosity = 0.0;
-            switch(PolymerModule::lowShearViscosityModel()){
-                case LowShearViscosityModel::None: {
-                    break;
-                }
-                case LowShearViscosityModel::HugginsEquation: {
-                    specificViscosity = k1 * x * (1.0 + k2 * x);
-                    break;
-                }
-                case LowShearViscosityModel::MartinsEquation: {
-                    specificViscosity = x*Opm::exp(k1*x);
-                    break;
-                }
-                case LowShearViscosityModel::CubicEquation: {
-                    specificViscosity = x*(1.0 + x*(k1 + k2*x)); // x + k1*x^2 + k2*x^3
-                    break;
-                }
-            }
-
-            // Correction due to shear thinning?
+            // Get cell-based shear-rate?
             Evaluation shearRate = 0.0;
             const auto& shearThinningModel = PolymerModule::shearThinningViscosityModel();
             const bool isShearThinning = shearThinningModel != ShearThinningViscosityModel::None;
@@ -1303,52 +1350,31 @@ public:
                 StashedValues& stashedValues = PolymerModule::stashedValues_[cellGlobalIdx];
                 shearRate = stashedValues.cell_shear_rate;
             }
-            cellShearRatePolymer_ = shearRate; // for output
 
-            switch (shearThinningModel) {
-                case ShearThinningViscosityModel::None: {
-                    break;
-                }
-                case ShearThinningViscosityModel::Meter: {
-                    if(shearRate < 1.0e-12){
-                        break;
-                    }
+            const Evaluation& Sw = fs.saturation(waterPhaseIdx);
+            const Scalar& porosity = elemCtx.problem().porosity(elemCtx, dofIdx, timeIdx);
+            const Scalar& temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
+            const Evaluation relWater = 1.0; // TO DO: Get rel.perm. of water also...
 
-                    const auto &plymeterCoefficients = PolymerModule::plymeterCoefficients(elemCtx, dofIdx, timeIdx);
-                    const Scalar p_alpha = plymeterCoefficients.p_alpha;
-                    const Scalar gamma_hf = plymeterCoefficients.gamma_hf;
-                    specificViscosity = specificViscosity / (1.0 + Opm::pow(shearRate / gamma_hf, p_alpha - 1.0));
-                    break;
-                }
-                case ShearThinningViscosityModel::CarreauYasuda: {
-                    if(shearRate < 1.0e-12 || polymerConcentration_ < 1.0e-12) {
-                        break;
-                    }
+            const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, dofIdx, timeIdx);
+            const Evaluation relativeViscosity = PolymerModule::calcRelativeViscosityPolymerMw(polymerConcentration_,
+                                                                                               // MDa --> kg/mol
+                                                                                               1.0e3*polymerMoleWeight_,
+                                                                                               polymerMixRegionIdx,
+                                                                                               shearRate,
+                                                                                               muWater,
+                                                                                               porosity,
+                                                                                               temperature,
+                                                                                               Sw,
+                                                                                               relWater);
 
-                    const auto &plycarrCoefficients = PolymerModule::plycarrCoefficients(elemCtx, dofIdx, timeIdx);
-                    const Scalar pow_x = plycarrCoefficients.x;
-                    const Scalar lam_a = plycarrCoefficients.lam_a;
-                    const Scalar lam_b = plycarrCoefficients.lam_b;
-                    const Scalar a_n = plycarrCoefficients.a_n;
-                    const Scalar b_n = plycarrCoefficients.b_n;
-                    const Scalar temperature = elemCtx.problem().temperature(elemCtx, dofIdx, timeIdx);
-                    const Evaluation pow_n = 1.0 - Opm::pow(1.0 + Opm::pow(a_n * x, b_n), -1.0);
-                    // Factor 1000.0 is to convert from MDa to kg/mol:
-                    const Evaluation lam1 = lam_a * Opm::pow(
-                            (muWater * specificViscosity * polymerMoleWeight_ * 1.0e3) /
-                            (polymerConcentration_ * temperature), lam_b);
-                    specificViscosity *= Opm::pow(1 + Opm::pow(lam1 * shearRate, pow_x), -pow_n / pow_x);
-                    break;
-                }
-            }
-
-            const Evaluation polymerRelativeViscosity = 1.0 + specificViscosity;
-            polymerApparentViscosity_ = muWater*polymerRelativeViscosity;
-
-            // We use the same correction factors as the ECLIPSE model for
-            // setting up and solving the flow equations:
-            waterViscosityCorrection_ = 1.0 / polymerRelativeViscosity;
+            // We use the same correction factors as the ECLIPSE model for setting up and solving the flow equations
+            waterViscosityCorrection_ = 1.0 / relativeViscosity;
             polymerViscosityCorrection_ = 1.0;
+
+            // Output
+            cellShearRatePolymer_ = shearRate;
+            polymerApparentViscosity_ = muWater*relativeViscosity;
         }
 
         // adjust water mobility
