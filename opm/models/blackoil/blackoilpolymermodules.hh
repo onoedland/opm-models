@@ -135,6 +135,15 @@ public:
         Scalar x;
     };
 
+    struct PlydegrCoefficients{
+        Scalar N_De;
+        Scalar el_m;
+        Scalar el_x;
+        Scalar rdeg;
+        Scalar alpha;
+        Scalar beta;
+    };
+
     // An experimental struct used when combining POLYMW with a non-Newtonian polymer solution.
     // We keep track of the latest water phase velocities + a cell-based shear-rate value.
     // The shear rate is calculated from the velocities and the rock-fluid properties.
@@ -530,9 +539,10 @@ public:
 
         if (enablePolymerMolarWeight) {
             plyvmhCoefficients_.resize(numRegions);
-            // Note: We resize both of these, even though at most one of them is used...
-            plymeterCoefficients_.resize(numRegions);
+            // Note: We resize all of these, even though they might not be used:
             plycarrCoefficients_.resize(numRegions);
+            plydegrCoefficients_.resize(numRegions);
+            plymeterCoefficients_.resize(numRegions);
         }
     }
 
@@ -903,12 +913,20 @@ public:
         return plymixparToddLongstaff_[polymerMixRegionIdx];
     }
 
-    static const PlyvmhCoefficients& plyvmhCoefficients(const ElementContext& elemCtx,
-                                                        const unsigned scvIdx,
-                                                        const unsigned timeIdx)
+    static const PlycarrCoefficients& plycarrCoefficients(const ElementContext& elemCtx,
+                                                          const unsigned scvIdx,
+                                                          const unsigned timeIdx)
     {
         const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
-        return plyvmhCoefficients_[polymerMixRegionIdx];
+        return plycarrCoefficients_[polymerMixRegionIdx];
+    }
+
+    static const PlydegrCoefficients& plydegrCoefficients(const ElementContext& elemCtx,
+                                                          const unsigned scvIdx,
+                                                          const unsigned timeIdx)
+    {
+        const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
+        return plydegrCoefficients_[polymerMixRegionIdx];
     }
 
     static const PlymeterCoefficients& plymeterCoefficients(const ElementContext& elemCtx,
@@ -919,12 +937,12 @@ public:
         return plymeterCoefficients_[polymerMixRegionIdx];
     }
 
-    static const PlycarrCoefficients& plycarrCoefficients(const ElementContext& elemCtx,
-                                                          const unsigned scvIdx,
-                                                          const unsigned timeIdx)
+    static const PlyvmhCoefficients& plyvmhCoefficients(const ElementContext& elemCtx,
+                                                        const unsigned scvIdx,
+                                                        const unsigned timeIdx)
     {
         const unsigned polymerMixRegionIdx = elemCtx.problem().plmixnumRegionIndex(elemCtx, scvIdx, timeIdx);
-        return plycarrCoefficients_[polymerMixRegionIdx];
+        return plyvmhCoefficients_[polymerMixRegionIdx];
     }
 
     static bool hasPlyshlog()
@@ -1142,9 +1160,10 @@ private:
     static ShearThinningViscosityModel shearThinningViscosityModel_;
     static InjectivityModel injectivityModel_;
 
-    static std::vector<PlyvmhCoefficients> plyvmhCoefficients_;
-    static std::vector<PlymeterCoefficients> plymeterCoefficients_;
     static std::vector<PlycarrCoefficients> plycarrCoefficients_;
+    static std::vector<PlydegrCoefficients> plydegrCoefficients_;
+    static std::vector<PlymeterCoefficients> plymeterCoefficients_;
+    static std::vector<PlyvmhCoefficients> plyvmhCoefficients_;
     static std::map<int, TabulatedTwoDFunction> plymwinjTables_;
     static std::map<int, TabulatedTwoDFunction> skprwatTables_;
     static std::map<int, SkprpolyTable> skprpolyTables_;
@@ -1222,16 +1241,20 @@ InjectivityModel
 BlackOilPolymerModule<TypeTag, enablePolymerV>::injectivityModel_;
 
 template <class TypeTag, bool enablePolymerV>
-std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlyvmhCoefficients>
-BlackOilPolymerModule<TypeTag, enablePolymerV>::plyvmhCoefficients_;
+std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlycarrCoefficients>
+BlackOilPolymerModule<TypeTag, enablePolymerV>::plycarrCoefficients_;
+
+template <class TypeTag, bool enablePolymerV>
+std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlydegrCoefficients>
+BlackOilPolymerModule<TypeTag, enablePolymerV>::plydegrCoefficients_;
 
 template <class TypeTag, bool enablePolymerV>
 std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlymeterCoefficients>
 BlackOilPolymerModule<TypeTag, enablePolymerV>::plymeterCoefficients_;
 
 template <class TypeTag, bool enablePolymerV>
-std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlycarrCoefficients>
-BlackOilPolymerModule<TypeTag, enablePolymerV>::plycarrCoefficients_;
+std::vector<typename BlackOilPolymerModule<TypeTag, enablePolymerV>::PlyvmhCoefficients>
+BlackOilPolymerModule<TypeTag, enablePolymerV>::plyvmhCoefficients_;
 
 template <class TypeTag, bool enablePolymerV>
 std::map<int, typename BlackOilPolymerModule<TypeTag, enablePolymerV>::TabulatedTwoDFunction>
