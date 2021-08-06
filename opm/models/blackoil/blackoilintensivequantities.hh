@@ -208,10 +208,9 @@ public:
                     fluidState_.setPressure(phaseIdx, po + (pC[phaseIdx] - pC[oilPhaseIdx]));
         }
 
-        // calculate relative permeabilities. note that we store the result into the
-        // mobility_ class attribute. the division by the phase viscosity happens later.
-        MaterialLaw::relativePermeabilities(mobility_, materialParams, fluidState_);
-        Opm::Valgrind::CheckDefined(mobility_);
+        // calculate relative permeabilities
+        MaterialLaw::relativePermeabilities(relativePermeability_, materialParams, fluidState_);
+        Opm::Valgrind::CheckDefined(relativePermeability_);
 
         // update the Saturation functions for the blackoil solvent module.
         asImp_().solventPostSatFuncUpdate_(elemCtx, dofIdx, timeIdx);
@@ -316,11 +315,11 @@ public:
 
             const auto& mu = FluidSystem::viscosity(fluidState_, paramCache, phaseIdx);
             if (enableExtbo && phaseIdx == oilPhaseIdx)
-              mobility_[phaseIdx] /= asImp_().oilViscosity();
+              mobility_[phaseIdx] = relativePermeability_[phaseIdx] / asImp_().oilViscosity();
             else if (enableExtbo && phaseIdx == gasPhaseIdx)
-              mobility_[phaseIdx] /= asImp_().gasViscosity();
+              mobility_[phaseIdx] = relativePermeability_[phaseIdx] / asImp_().gasViscosity();
             else
-              mobility_[phaseIdx] /= mu;
+              mobility_[phaseIdx] = relativePermeability_[phaseIdx] / mu;
         }
         Opm::Valgrind::CheckDefined(mobility_);
 
@@ -449,8 +448,7 @@ public:
      */
     Evaluation relativePermeability(unsigned phaseIdx) const
     {
-        // warning: slow
-        return fluidState_.viscosity(phaseIdx)*mobility(phaseIdx);
+        return relativePermeability_[phaseIdx];
     }
 
     /*!
@@ -477,6 +475,7 @@ private:
     FluidState fluidState_;
     Scalar referencePorosity_;
     Evaluation porosity_;
+    Evaluation relativePermeability_[numPhases];
     Evaluation mobility_[numPhases];
 };
 
